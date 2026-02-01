@@ -1,0 +1,51 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.log
+.venv/
+venv/
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Training outputs / caches
+runs/
+**/runs/
+*.cache
+
+# Datasets (usually huge; keep structure/configs, ignore images)
+dataset/images/
+dataset/train/images/
+dataset/val/images/
+dataset/test/images/
+
+# If you want to version labels, comment these out
+dataset/train/labels/
+dataset/val/labels/
+dataset/test/labels/
+
+# Embedded third-party datasets inside src/
+src/datasets/
+src/Electronic-Components-1/
+src/OneShot_Demo_Dataset/
+
+# Large model artifacts (prefer Git LFS or Releases)
+*.pt
+*.onnx
+*.engine
+*.tflite
+*.pth
+*.ckpt
+
+# OpenVINO / GPU cache & large binaries
+*.cl_cache
+*.blob
+src/openvino_tinyllama_model/model_cache/
+*.xml
+*.bin
+
