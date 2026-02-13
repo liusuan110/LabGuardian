@@ -1,0 +1,18 @@
+names:
+- CAPACITOR
+- DIODE
+- LED
+- RESISTOR
+- Push_Button
+- Wire
+nc: 6
+path: d:\desktop\inter\LabGuardian\src\Electronic-Components-1
+roboflow:
+  license: CC BY 4.0
+  project: electronic-components-lj8xp-13yoa
+  url: https://universe.roboflow.com/lsa-vtrbd/electronic-components-lj8xp-13yoa/dataset/1
+  version: 1
+  workspace: lsa-vtrbd
+test: train/images
+train: train/images
+val: train/images
