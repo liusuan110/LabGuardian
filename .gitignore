@@ -49,3 +49,8 @@ src/openvino_tinyllama_model/model_cache/
 *.xml
 *.bin
 
+# RAG / ChromaDB 持久化数据 (自动生成)
+knowledge_base/chroma_db/
+
+# Embedding 模型本地缓存
+models/text2vec_chinese/
