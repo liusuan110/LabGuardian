@@ -780,13 +780,34 @@ class MainWindow(QMainWindow):
         results = validator.compare(self.analyzer)
 
         output = "--- 验证报告 ---\n"
+
+        # v3: 显示相似度和进度
+        similarity = results.get('similarity', 0)
+        progress = results.get('progress', 0)
+        if similarity > 0:
+            output += f"📏 电路相似度: {similarity:.0%}\n"
+        if 0 < progress < 1.0:
+            output += f"📊 搭建进度: {progress:.0%}\n"
+
         for msg in results.get('errors', []):
             output += f"{msg}\n"
             self._circuit_page.append_result(msg)
 
+        # v3: 显示极性错误
+        for pol_err in results.get('polarity_errors', []):
+            output += f"{pol_err}\n"
+
         self.ar_missing_links = results.get('missing_links', [])
         if self.ar_missing_links:
             output += f"\n⚠️ 缺失连接: {len(self.ar_missing_links)} 处 (已在视频中标注)"
+
+        # v3: 显示缺失/多余元件摘要
+        missing_c = results.get('missing_components', [])
+        extra_c = results.get('extra_components', [])
+        if missing_c:
+            output += f"\n📋 待搭建元件: {', '.join(missing_c)}"
+        if extra_c:
+            output += f"\n📋 多余元件: {', '.join(extra_c)}"
 
         self._circuit_page.set_result(output)
         self._log_all(f"验证完成: {len(results.get('errors', []))} 个问题")

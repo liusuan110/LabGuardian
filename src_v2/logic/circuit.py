@@ -1,18 +1,21 @@
-"""
-电路拓扑建模模块 (v2)
-职责：将检测到的元件构建为电气连接图，生成网表描述
+"""电路拓扑建模模块
 
-增强功能 (v2):
-  1. 元件极性/引脚角色感知 (polarity, pin_roles)
-  2. 电源网络识别 (VCC/GND 标记)
-  3. 置信度加权连接
-  4. 完整网表导出 (供 LLM 理解和 LVS 比较)
+职责
+----
+将检测到的元件构建为电气连接图，生成网表描述。
 
-参考:
-  - SKiDL (devbisme/skidl): Net/Part/Pin 数据模型
-  - schematic-o-matic (nickbild): 面包板→网表映射逻辑
-  - NetworkX VF2++: 带标签图同构 (Jüttner & Madarasi, 2018)
-  - EDA LVS (Layout Versus Schematic) 方法论
+核心能力
+--------
+1. 元件极性 / 引脚角色感知 (polarity, pin_roles)
+2. 电源网络识别 (VCC / GND 标记)
+3. 置信度加权连接
+4. 结构化网表导出 (供 LLM 理解和 LVS 比较)
+
+参考
+----
+- SKiDL (devbisme/skidl): Net/Part/Pin 数据模型
+- schematic-o-matic (nickbild): 面包板→网表映射
+- NetworkX VF2++ (Jüttner & Madarasi, 2018): 带标签图同构
 """
 
 import logging
@@ -31,8 +34,8 @@ logger = logging.getLogger(__name__)
 
 class Polarity(Enum):
     """元件极性 / 方向"""
-    NONE = "none"            # 无极性 (电阻, 导线)
-    FORWARD = "forward"      # 正向: pin1=阳极/正极, pin2=阴极/负极
+    NONE = "none"            # 无极性（电阻、导线）
+    FORWARD = "forward"      # 正向: pin1=阳极, pin2=阴极
     REVERSE = "reverse"      # 反向: pin1=阴极, pin2=阳极
     UNKNOWN = "unknown"      # 有极性但未确定方向
 
@@ -53,27 +56,30 @@ class PinRole(Enum):
 
 @dataclass
 class CircuitComponent:
-    """
-    电路元件 (增强版)
+    """电路元件数据类。
 
-    新增字段:
-      - polarity: 元件极性 (有极性元件如二极管, 由 PolarityResolver 填充)
-      - pin_roles: 各引脚的角色 (e.g., anode/cathode, B/C/E)
-      - confidence: 检测置信度 (来自 YOLO)
-      - orientation_deg: OBB 旋转角度 (度)
+    Attributes:
+        name: 元件名称 (e.g. "R1", "LED1")
+        type: 元件类型 (e.g. "RESISTOR", "LED")
+        pin1_loc: 引脚1 坐标 (Row, Col)
+        pin2_loc: 引脚2 坐标 (可为空)
+        polarity: 极性方向 (由 PolarityResolver 填充)
+        pin_roles: 各引脚角色 (e.g. anode/cathode, B/C/E)
+        confidence: 检测置信度 (来自 YOLO)
+        orientation_deg: OBB 旋转角度
+        pin3_loc: 三极管第三引脚坐标
     """
-    name: str          # e.g., "R1", "LED1"
-    type: str          # e.g., "RESISTOR", "Wire", "LED"
-    pin1_loc: Tuple[str, str]  # (Row, Col) e.g., ("15", "a")
-    pin2_loc: Optional[Tuple[str, str]] = None  # (Row, Col) e.g., ("20", "a")
+    name: str          # e.g. "R1", "LED1"
+    type: str          # e.g. "RESISTOR", "Wire", "LED"
+    pin1_loc: Tuple[str, str]  # (行, 列) e.g. ("15", "a")
+    pin2_loc: Optional[Tuple[str, str]] = None
 
-    # --- v2 新增字段 ---
     polarity: Polarity = Polarity.NONE
     pin_roles: Tuple[PinRole, ...] = (PinRole.GENERIC, PinRole.GENERIC)
     confidence: float = 1.0
     orientation_deg: float = 0.0
 
-    # 三极管专用: 第三引脚
+    # 三极管第三引脚
     pin3_loc: Optional[Tuple[str, str]] = None
 
     def __repr__(self):
@@ -102,17 +108,10 @@ POWER_KEYWORDS = {"VCC", "GND", "POWER", "BATTERY"}  # 电源相关关键词
 
 
 class CircuitAnalyzer:
-    """
-    电路拓扑分析器 (v2)
+    """电路拓扑分析器。
 
-    基于 NetworkX 图论，将面包板上检测到的元件建模为电气连接图
-    面包板规则：同一行 a-e 导通 (Left节点), f-j 导通 (Right节点)
-
-    v2 增强:
-      - 电源网络标记 (自动识别 VCC/GND 网络)
-      - 极性感知的连接建模
-      - 置信度加权边
-      - 完整网表导出
+    基于 NetworkX 图论，将面包板上检测到的元件建模为电气连接图。
+    面包板规则: 同一行 a-e 导通 (Left节点), f-j 导通 (Right节点)。
     """
 
     def __init__(self):
@@ -127,11 +126,9 @@ class CircuitAnalyzer:
         self.power_nets = {}
 
     def add_component(self, comp: CircuitComponent):
-        """
-        添加一个元件到电路图中
-        自动根据面包板导通规则生成电气节点
+        """添加元件到电路图，自动根据面包板导通规则生成电气节点。
 
-        v2 增强: 边携带极性/置信度/引脚角色属性
+        边属性携带极性 / 置信度 / 引脚角色信息。
         """
         self.components.append(comp)
 
@@ -162,7 +159,10 @@ class CircuitAnalyzer:
 
     @staticmethod
     def _get_node_name(loc: Tuple[str, str]) -> str:
-        """根据面包板规则将 (Row, Col) 映射为电气节点名"""
+        """根据面包板规则将 (Row, Col) 映射为电气节点名。
+
+        a-e → Row{n}_L, f-j → Row{n}_R
+        """
         row, col = loc
         if col in ('a', 'b', 'c', 'd', 'e'):
             return f"Row{row}_L"
@@ -190,18 +190,15 @@ class CircuitAnalyzer:
         return u
 
     def build_topology_graph(self) -> nx.Graph:
-        """
-        构建布局无关的拓扑图 (双部图)
+        """构建布局无关的拓扑图（双部图）。
 
         节点类型:
-        - Net节点: kind='net' (电气网络)
-        - 元件节点: kind='comp', ctype='RESISTOR'|'LED'|..., polarity=...
+          - Net节点 (kind='net'): 电气网络
+          - 元件节点 (kind='comp'): 携带 ctype / polarity 标签
 
-        Wire 被视为理想导体，合并到网络中
-
-        v2 增强: 节点携带极性信息, 用于 VF2++ 带标签图同构
+        Wire 被视为理想导体，合并到网络中，不生成元件节点。
         """
-        # 构建仅含导体(Wire)的子图
+        # 构建仅含 Wire 的子图，用于确定电气网络连通性
         conductor = nx.Graph()
         conductor.add_nodes_from(self.graph.nodes())
 
@@ -209,7 +206,7 @@ class CircuitAnalyzer:
             if self._norm_type(data.get("type", "")) == "WIRE":
                 conductor.add_edge(u, v)
 
-        # 每个连通分量是一个电气网络
+        # 每个 Wire 连通分量代表一个电气网络
         net_groups = list(nx.connected_components(conductor))
         node_to_net = {}
         for i, group in enumerate(net_groups):
@@ -218,7 +215,7 @@ class CircuitAnalyzer:
 
         topo = nx.Graph()
 
-        # 添加网络节点 (标记电源类型)
+        # 添加网络节点（标记电源类型）
         self._identify_power_nets()
         for i in range(len(net_groups)):
             net_id = f"N{i}"
@@ -230,7 +227,7 @@ class CircuitAnalyzer:
                     break
             topo.add_node(net_id, **attrs)
 
-        # 添加元件节点 (排除 Wire, 携带极性)
+        # 添加元件节点（跳过 Wire，携带极性标签）
         comp_idx = 0
         for comp in self.components:
             ctype = self._norm_type(comp.type)
@@ -286,10 +283,7 @@ class CircuitAnalyzer:
         return topo
 
     def get_circuit_description(self) -> str:
-        """
-        生成自然语言描述的电路网表 (供 LLM 理解)
-        v2 增强: 包含极性/引脚角色/电源网络信息
-        """
+        """生成自然语言描述的电路网表，供 LLM 理解电路连接关系。"""
         if not self.components:
             return "No circuit components detected."
 
@@ -351,14 +345,7 @@ class CircuitAnalyzer:
     # ========================================================
 
     def _identify_power_nets(self):
-        """
-        启发式识别电源网络
-
-        策略:
-        1. 如果某个 Net 连接电池/电源模块 → VCC/GND
-        2. 如果某个 Net 连接面包板电源轨 (最上/最下行) → VCC/GND
-        3. 按面包板约定: 红色轨=VCC, 蓝色轨=GND (通常 Row1=+, Row30=-)
-        """
+        """启发式识别电源网络：根据元件类型和引脚角色标记 VCC / GND。"""
         for comp in self.components:
             ctype = self._norm_type(comp.type)
             # 电池/电源模块的引脚直接标记
@@ -401,23 +388,18 @@ class CircuitAnalyzer:
         return sorted(missing)
 
     # ========================================================
-    # 网表导出 (供 LVS 比较和 LLM 分析)
+    # 网表导出
     # ========================================================
 
     def export_netlist(self) -> Dict:
-        """
-        导出结构化网表, 类似 SPICE netlist 格式
+        """导出结构化网表（类 SPICE 格式）。
 
-        返回:
-            {
-                'nets': {net_id: [node_names]},
-                'components': [
-                    {name, type, polarity, pins: [{loc, role, net}]}
-                ],
-                'power': {net_id: 'VCC'|'GND'},
-            }
+        Returns:
+            dict 包含::
 
-        参考: SKiDL 的 Net/Part/Pin 数据模型 (devbisme/skidl)
+                nets        网络分组 {net_id: [node_names]}
+                components  元件列表 [{name, type, polarity, pins}]
+                power       电源映射 {net_id: 'VCC'|'GND'}
         """
         self._identify_power_nets()
 

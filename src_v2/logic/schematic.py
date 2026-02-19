@@ -1,6 +1,9 @@
-"""
-原理图可视化模块
-职责：根据 CircuitAnalyzer 的元件列表绘制电路原理图
+"""原理图可视化模块
+
+职责
+----
+根据 CircuitAnalyzer 的元件列表，使用 schemdraw 绘制电路原理图。
+将面包板逻辑坐标 (Row, Col) 映射为二维绘图坐标。
 """
 
 import schemdraw
@@ -10,7 +13,13 @@ from .circuit import CircuitAnalyzer
 
 
 class SchematicGenerator:
-    """基于 schemdraw 的电路原理图生成器"""
+    """基于 schemdraw 的电路原理图生成器。
+
+    Attributes:
+        X_SCALE: 行号 → x 坐标的缩放系数
+        Y_OFFSET_TOP: a-e 列（Left侧）的 y 偏移
+        Y_OFFSET_BOTTOM: f-j 列（Right侧）的 y 偏移
+    """
 
     X_SCALE = 1.0
     Y_OFFSET_TOP = 0
@@ -63,7 +72,7 @@ class SchematicGenerator:
 
     @classmethod
     def _get_xy(cls, loc_tuple):
-        """将逻辑坐标 ('15', 'a') 转为绘图坐标 (x, y)"""
+        """将面包板逻辑坐标 ('15', 'a') 转为绘图坐标 (x, y)。"""
         row_str, col_str = loc_tuple
         try:
             strip_idx = int(row_str)
@@ -76,7 +85,7 @@ class SchematicGenerator:
 
     @staticmethod
     def _type_to_element(comp_type, start, end, label):
-        """根据元件类型选择 schemdraw 符号"""
+        """根据元件类型选择 schemdraw 符号，未识别类型回退为方块电阻。"""
         t = comp_type.upper()
 
         if "RESISTOR" in t or "RESIST" in t:
