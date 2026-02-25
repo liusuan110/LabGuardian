@@ -21,6 +21,7 @@ from PySide6.QtWidgets import QApplication
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QFont
 
+from app_context import AppContext
 from gui_qt.main_window import MainWindow
 from gui_qt.styles import GLOBAL_STYLE
 
@@ -62,8 +63,11 @@ def main():
     font.setStyleHint(QFont.StyleHint.SansSerif)
     app.setFont(font)
 
+    # 创建 AppContext (服务注册中心)
+    ctx = AppContext()
+
     # 主窗口
-    window = MainWindow()
+    window = MainWindow(ctx=ctx)
     window.show()
 
     sys.exit(app.exec())

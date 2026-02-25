@@ -17,6 +17,25 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from config import vision as vision_cfg, find_best_yolo_model, TWO_PIN_COMPONENTS
 
 
+# ============================================================
+# 引脚延伸先验 — 补偿元件遮挡导致的引脚位置偏差
+# ============================================================
+# OBB / HBB 只捕获元件本体, 真实引脚插入点在本体外侧。
+# 比例含义: 沿长轴方向, 每端向外延伸 (长边长度 × 比例) 个像素。
+# 参考: 电阻色环体 ≈ 6mm, 引线外露 ≈ 2-4mm → 比例 0.08-0.12
+
+_PIN_EXTENSION = {
+    "RESISTOR":    0.10,  # 电阻: 引线细长, 略超出体边
+    "Resistor":    0.10,
+    "LED":         0.08,  # LED: 引脚从底座伸出, 顶视遮挡严重
+    "DIODE":       0.10,  # 二极管: 类似电阻
+    "CAPACITOR":   0.08,  # 电容: 引脚较短
+    "Wire":        0.02,  # 导线: 端点基本就是连接点
+    "Push_Button": 0.06,  # 按钮: 引脚在底部
+}
+_DEFAULT_PIN_EXTENSION = 0.08
+
+
 @dataclass
 class Detection:
     """单个检测结果的结构化表示"""
@@ -153,19 +172,40 @@ class ComponentDetector:
 
     @staticmethod
     def _extract_pins_obb(cls_name: str, corners: np.ndarray):
-        """从 OBB 旋转框中提取两端引脚坐标"""
+        """从 OBB 旋转框中提取两端引脚坐标 (含遮挡补偿延伸)。
+
+        元件本体遮挡引脚时，OBB 短边中点 ≠ 真实引脚插入点。
+        沿长轴方向向外延伸，使估计位置更接近实际孔洞。
+        """
         p0, p1, p2, p3 = corners
         d01 = np.linalg.norm(p0 - p1)
         d12 = np.linalg.norm(p1 - p2)
 
         if cls_name in TWO_PIN_COMPONENTS:
             if d01 < d12:
-                pin1 = tuple(((p0 + p1) / 2).tolist())
-                pin2 = tuple(((p2 + p3) / 2).tolist())
+                # d01 是短边, d12 是长边
+                mid1 = (p0 + p1) / 2   # 短边中点 → pin1 初始估计
+                mid2 = (p2 + p3) / 2   # 对侧短边中点 → pin2 初始估计
+                long_len = d12
             else:
-                pin1 = tuple(((p1 + p2) / 2).tolist())
-                pin2 = tuple(((p3 + p0) / 2).tolist())
+                mid1 = (p1 + p2) / 2
+                mid2 = (p3 + p0) / 2
+                long_len = d01
+
+            # 沿长轴向外延伸, 补偿元件遮挡
+            ext_ratio = _PIN_EXTENSION.get(cls_name, _DEFAULT_PIN_EXTENSION)
+            direction = mid2 - mid1
+            dir_len = np.linalg.norm(direction)
+            if dir_len > 1e-5:
+                unit_dir = direction / dir_len
+                extension = ext_ratio * long_len
+                pin1 = tuple((mid1 - unit_dir * extension).tolist())
+                pin2 = tuple((mid2 + unit_dir * extension).tolist())
+            else:
+                pin1 = tuple(mid1.tolist())
+                pin2 = tuple(mid2.tolist())
         else:
+            # 非二端元件 (三极管等): 保持原策略
             cx = np.mean(corners[:, 0])
             cy = np.mean(corners[:, 1])
             h = np.max(corners[:, 1]) - np.min(corners[:, 1])
@@ -176,13 +216,21 @@ class ComponentDetector:
 
     @staticmethod
     def _extract_pins_hbb(cls_name, x1, y1, x2, y2, w, h, cx, cy):
-        """从 HBB 标准框中提取两端引脚坐标"""
+        """从 HBB 标准框中提取两端引脚坐标 (含遮挡补偿延伸)。
+
+        将引脚估计从 bbox 边缘向外延伸, 更接近真实插入点。
+        """
+        ext_ratio = _PIN_EXTENSION.get(cls_name, _DEFAULT_PIN_EXTENSION)
         if w > h:
-            pin1 = (x1 + w * 0.1, cy)
-            pin2 = (x2 - w * 0.1, cy)
+            # 水平元件: 引脚在左右两端外侧
+            extension = w * ext_ratio
+            pin1 = (x1 - extension, cy)
+            pin2 = (x2 + extension, cy)
         else:
-            pin1 = (cx, y1 + h * 0.1)
-            pin2 = (cx, y2 - h * 0.1)
+            # 垂直元件: 引脚在上下两端外侧
+            extension = h * ext_ratio
+            pin1 = (cx, y1 - extension)
+            pin2 = (cx, y2 + extension)
         return pin1, pin2
 
     def annotate_frame(self, frame: np.ndarray, detections: List[Detection]) -> np.ndarray:
@@ -234,3 +282,33 @@ class ComponentDetector:
                          (0, 255, 0), 2)
 
         return annotated
+
+    @staticmethod
+    def offset_detections(detections: List[Detection],
+                          roi_x: int, roi_y: int) -> List[Detection]:
+        """
+        将 ROI 裁剪区域内的检测坐标偏移回原帧坐标系
+
+        当 YOLO 在裁剪后的 ROI 子图上运行时, 所有坐标都相对于 ROI 左上角。
+        此方法将 bbox / pin / obb_corners 全部加上 (roi_x, roi_y) 偏移。
+
+        Args:
+            detections: ROI 坐标系下的检测结果 (会被原地修改)
+            roi_x: ROI 左上角在原帧中的 x 坐标
+            roi_y: ROI 左上角在原帧中的 y 坐标
+
+        Returns:
+            偏移后的检测结果列表 (同一个列表, 原地修改)
+        """
+        for det in detections:
+            x1, y1, x2, y2 = det.bbox
+            det.bbox = (x1 + roi_x, y1 + roi_y, x2 + roi_x, y2 + roi_y)
+            if det.pin1_pixel:
+                det.pin1_pixel = (det.pin1_pixel[0] + roi_x,
+                                  det.pin1_pixel[1] + roi_y)
+            if det.pin2_pixel:
+                det.pin2_pixel = (det.pin2_pixel[0] + roi_x,
+                                  det.pin2_pixel[1] + roi_y)
+            if det.obb_corners is not None:
+                det.obb_corners = det.obb_corners + np.array([roi_x, roi_y])
+        return detections

@@ -43,6 +43,10 @@ LOG_DIR = PROJECT_ROOT / "logs"
 if str(LAUNCHER_DIR) not in sys.path:
     sys.path.insert(0, str(LAUNCHER_DIR))
 
+# 确保 LabGuardian/ 根目录在路径中 (用于导入 shared/ 和 teacher/)
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 # 切换工作目录到 src_v2（兼容相对路径引用）
 os.chdir(LAUNCHER_DIR)
 
@@ -308,6 +312,7 @@ def launch_gui(logger: logging.Logger):
 
     from gui_qt.main_window import MainWindow
     from gui_qt.styles import GLOBAL_STYLE
+    from config import classroom as classroom_cfg
 
     # HiDPI 支持
     QApplication.setHighDpiScaleFactorRoundingPolicy(
@@ -324,10 +329,28 @@ def launch_gui(logger: logging.Logger):
     app.setFont(font)
     logger.info(f"字体: {font_family} {font_size}pt")
 
+    # ---- 课堂模式: 启动教师服务器 (Hub) ----
+    if classroom_cfg.enabled and classroom_cfg.is_hub:
+        try:
+            from teacher.server import start_teacher_server
+            start_teacher_server(
+                host=classroom_cfg.server_host,
+                port=classroom_cfg.server_port,
+            )
+            logger.info(
+                f"课堂模式: 教师服务器已启动 "
+                f"http://{classroom_cfg.server_host}:{classroom_cfg.server_port}"
+            )
+        except Exception as e:
+            logger.warning(f"课堂模式: 教师服务器启动失败 — {e}")
+
     # 主窗口
     window = MainWindow()
     window.show()
     logger.info("GUI 已启动")
+
+    if classroom_cfg.enabled:
+        logger.info(f"课堂模式: 工位 {classroom_cfg.station_id}, 服务器 {classroom_cfg.server_url}")
 
     exit_code = app.exec()
     logger.info(f"GUI 退出, code={exit_code}")
@@ -377,6 +400,10 @@ def main():
   python launcher.py --diag       仅诊断
   python launcher.py --watchdog   看门狗模式（评审推荐）
   python launcher.py --env .env   指定环境文件
+
+课堂模式:
+  python launcher.py --classroom                    Hub 模式 (本机运行教师服务器)
+  python launcher.py --classroom --station-id A05 --server-url http://192.168.1.100:8080
         """
     )
     parser.add_argument("--diag", action="store_true",
@@ -387,6 +414,17 @@ def main():
                         help=".env 文件路径 (默认自动搜索)")
     parser.add_argument("--no-diag", action="store_true",
                         help="跳过启动诊断（加速启动）")
+    # ---- 课堂模式参数 ----
+    parser.add_argument("--classroom", action="store_true",
+                        help="启用课堂模式 (教师服务器 + 心跳上报)")
+    parser.add_argument("--station-id", type=str, default="",
+                        help="工位编号 (默认自动生成)")
+    parser.add_argument("--student-name", type=str, default="",
+                        help="学生姓名")
+    parser.add_argument("--server-url", type=str, default="",
+                        help="教师服务器地址 (默认 http://localhost:8080)")
+    parser.add_argument("--hub", action="store_true",
+                        help="本机作为 Hub (运行教师服务器)")
     args = parser.parse_args()
 
     # === 日志 ===
@@ -411,6 +449,25 @@ def main():
 
     # === 全局异常钩子 ===
     setup_exception_hook(logger)
+
+    # === 课堂模式: 命令行参数覆盖 config ===
+    if args.classroom:
+        from config import classroom as classroom_cfg
+        classroom_cfg.enabled = True
+        if args.hub or not args.server_url:
+            classroom_cfg.is_hub = True
+        if args.station_id:
+            classroom_cfg.station_id = args.station_id
+        if args.student_name:
+            classroom_cfg.student_name = args.student_name
+        if args.server_url:
+            classroom_cfg.server_url = args.server_url
+        # Hub 模式下确保 station_id 已生成
+        if not classroom_cfg.station_id:
+            import socket
+            classroom_cfg.station_id = socket.gethostname()[:12]
+        logger.info(f"课堂模式已启用: station={classroom_cfg.station_id}, "
+                     f"hub={classroom_cfg.is_hub}, server={classroom_cfg.server_url}")
 
     # === 依赖检查 ===
     if not check_dependencies(logger):

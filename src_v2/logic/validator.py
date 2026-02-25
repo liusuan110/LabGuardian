@@ -40,6 +40,7 @@ from .circuit import (
     CircuitAnalyzer, CircuitComponent,
     Polarity, PinRole,
     POLARIZED_TYPES, THREE_PIN_TYPES,
+    norm_component_type,
 )
 
 logger = logging.getLogger(__name__)
@@ -754,6 +755,99 @@ class CircuitValidator:
                 result['errors'].append(
                     f"   {ctype} connectivity differs: "
                     f"ref degrees={ref_degrees}, current={cur_degrees}")
+
+    # ----------------------------------------------------------------
+    # 独立电路诊断 (无需参考电路)
+    # ----------------------------------------------------------------
+
+    @staticmethod
+    def diagnose(analyzer: CircuitAnalyzer) -> List[str]:
+        """基于拓扑的独立电路诊断，不依赖参考电路。
+
+        检查项:
+          1. LED 缺少限流电阻 (同网络中无 RESISTOR)
+          2. 有极性元件极性未知
+          3. 元件两引脚在同一导通组 (短路/未跨行)
+          4. 孤立元件 (只有一个连接, 无法形成回路)
+          5. 三极管引脚缺失 (只检测到2个引脚)
+          6. 开路检测 (网络只连接一个元件端子)
+        """
+        issues = []
+        g = analyzer.graph
+
+        for comp in analyzer.components:
+            ctype = norm_component_type(comp.type)
+
+            # --- 1. LED 限流电阻检查 (通过图路径) ---
+            if ctype == "LED" and comp.pin2_loc:
+                n1 = analyzer._get_node_name(comp.pin1_loc)
+                n2 = analyzer._get_node_name(comp.pin2_loc)
+                # 检查 LED 所在的两个网络中是否有直接相邻的电阻
+                has_resistor = False
+                for node in (n1, n2):
+                    if node not in g:
+                        continue
+                    for neighbor in g.neighbors(node):
+                        edge_data = g.get_edge_data(node, neighbor)
+                        if edge_data and norm_component_type(
+                                edge_data.get('type', '')) == "RESISTOR":
+                            has_resistor = True
+                            break
+                    if has_resistor:
+                        break
+                if not has_resistor:
+                    issues.append(
+                        f"{comp.name}: LED所在网络中未检测到限流电阻, "
+                        f"建议在{n1}或{n2}串联220Ω-1kΩ电阻")
+
+            # --- 2. 极性未知 ---
+            if ctype in POLARIZED_TYPES and comp.polarity == Polarity.UNKNOWN:
+                issues.append(f"{comp.name}: {ctype}极性未确定, 请目视检查安装方向")
+
+            # --- 3. 同导通组短路 ---
+            if comp.pin2_loc:
+                n1 = analyzer._get_node_name(comp.pin1_loc)
+                n2 = analyzer._get_node_name(comp.pin2_loc)
+                if n1 == n2 and ctype not in ("WIRE",):
+                    issues.append(
+                        f"{comp.name}: {ctype}两引脚在同一导通组({n1}), "
+                        f"元件被短路或未正确跨行插入")
+
+            # --- 4. 三极管引脚缺失 ---
+            if ctype in THREE_PIN_TYPES and comp.pin3_loc is None:
+                issues.append(
+                    f"{comp.name}: 三极管仅检测到2个引脚, "
+                    f"无法确定B/C/E, 请检查是否正确跨行插入")
+
+        # --- 5. 孤立元件 (度 = 1,只有一端接入网络) ---
+        for comp in analyzer.components:
+            ctype = norm_component_type(comp.type)
+            if ctype == "WIRE":
+                continue
+            nodes_of_comp = set()
+            nodes_of_comp.add(analyzer._get_node_name(comp.pin1_loc))
+            if comp.pin2_loc:
+                nodes_of_comp.add(analyzer._get_node_name(comp.pin2_loc))
+            if comp.pin3_loc:
+                nodes_of_comp.add(analyzer._get_node_name(comp.pin3_loc))
+
+            for node in nodes_of_comp:
+                if node in g and g.degree(node) == 1:
+                    # 该节点只有一条边 (就是这个元件自身), 悬空端
+                    issues.append(
+                        f"{comp.name}: 引脚{node}仅连接到该元件自身, "
+                        f"可能为悬空引脚, 无法形成回路")
+                    break  # 每个元件只报一次
+
+        # --- 6. 网络连通性: 非连通图意味着电路未闭合 ---
+        if g.number_of_nodes() > 0:
+            n_components = nx.number_connected_components(g)
+            if n_components > 1:
+                issues.append(
+                    f"电路图有 {n_components} 个独立子网络, "
+                    f"可能存在断路或缺少连线")
+
+        return issues
 
 
 

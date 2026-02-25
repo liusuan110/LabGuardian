@@ -82,6 +82,15 @@ class VisionConfig:
     model_name_hint: str = "lab_guardian"  # 自动搜索模型时的名称关键词
     preferred_model: str = "lab_guardian_oneshot_v1"  # 优先加载的模型名
 
+    # ROI 裁剪 (校准后只检测面包板区域)
+    roi_enabled: bool = True              # 启用 ROI 裁剪优化
+    roi_padding: int = 30                 # ROI 外扩像素 (防止边缘元件被截断)
+
+    # 帧差分跳帧 (无变化时复用上帧结果)
+    frame_diff_enabled: bool = True       # 启用帧差分优化
+    frame_diff_threshold: float = 5.0     # 灰度均值差 < 此值则跳帧
+    max_skip_frames: int = 15             # 最大连续跳帧数 (安全网, 强制重新检测)
+
 
 # ============================================================
 # 面包板校准配置
@@ -180,15 +189,23 @@ class LLMConfig:
     """
     大语言模型配置
 
-    三级降级策略:
-      1. Cloud: DeepSeek / Qwen 等 OpenAI 兼容 API (需联网)
-      2. Local: Qwen2.5-1.5B 等小模型 via OpenVINO GenAI (离线, NPU/GPU)
-      3. Rule:  领域规则模板引擎 (零依赖兜底)
+    降级策略 (竞赛离线模式):
+      1. Local NPU  — Qwen2.5-1.5B INT4 via openvino_genai (首选)
+      2. Local GPU   — 同上, 回退到 iGPU
+      3. Local CPU   — 同上, 回退到 CPU
+      4. Rule        — 领域规则模板引擎 (零依赖兜底)
+
+    降级策略 (开发/联网模式):
+      1. Cloud       — DeepSeek / Qwen 等 OpenAI 兼容 API
+      2-4. 同上
 
     API Key 从环境变量读取, 永远不要硬编码
     """
-    use_cloud: bool = True                 # 是否尝试云端 API
-    cloud_provider: str = "deepseek"       # 提供商
+    # ---- 竞赛模式 (跳过 Cloud, 纯离线) ----
+    competition_mode: bool = True           # 竞赛环境无网络, 跳过所有 Cloud 尝试
+
+    use_cloud: bool = True                  # competition_mode=True 时自动禁用
+    cloud_provider: str = "deepseek"        # 提供商
 
     # 云端 API 参数
     cloud_api_key: str = ""
@@ -197,9 +214,14 @@ class LLMConfig:
 
     # 本地模型参数
     local_model_path: str = ""
-    local_device: str = "NPU"              # "CPU", "GPU", "NPU"
+    local_device: str = "NPU"              # 首选设备: "NPU", "GPU", "CPU"
+    local_device_fallback: tuple = ("NPU", "GPU", "CPU")  # 降级链
     max_tokens: int = 300
     temperature: float = 0.7
+
+    # NPU 优化参数 (针对 Intel Core Ultra 5 225U)
+    npu_warm_up: bool = True               # 启动时预热 NPU (避免首次推理卡顿)
+    npu_cache_dir: str = ".npucache"       # NPU 编译缓存目录 (加速二次启动)
 
     # 本地模型搜索路径 (按优先级)
     local_model_search_names: tuple = (
@@ -210,12 +232,19 @@ class LLMConfig:
     )
 
     def __post_init__(self):
+        # 竞赛模式强制禁用 Cloud
+        if self.competition_mode:
+            self.use_cloud = False
+
         # API Key 优先从环境变量读取
         self.cloud_api_key = os.environ.get("LG_API_KEY",
                              os.environ.get("DEEPSEEK_API_KEY", self.cloud_api_key))
         self.cloud_base_url = os.environ.get("LG_API_BASE_URL", self.cloud_base_url)
         self.cloud_model_name = os.environ.get("LG_API_MODEL", self.cloud_model_name)
         self.local_device = os.environ.get("LG_LLM_DEVICE", self.local_device)
+        self.competition_mode = os.environ.get(
+            "LG_COMPETITION_MODE", str(self.competition_mode)
+        ).lower() in ("true", "1", "yes")
 
         # 自动搜索最佳本地模型
         self.local_model_path = self._find_best_local_model()
@@ -276,6 +305,52 @@ class GUIConfig:
 
 
 # ============================================================
+# 课堂模式配置
+# ============================================================
+
+@dataclass
+class ClassroomConfig:
+    """
+    课堂监控配置 (学生端 ↔ 教师端)
+
+    启用方式:
+      命令行: python launcher.py --classroom
+      环境变量: LG_CLASSROOM=true
+
+    角色:
+      - Hub (is_hub=True): 本机同时运行教师服务器 + 学生端
+      - Client (is_hub=False): 本机仅运行学生端, 心跳上报到 Hub
+    """
+    enabled: bool = False                           # 是否启用课堂模式
+    station_id: str = ""                            # 工位编号 (空=自动生成)
+    student_name: str = ""                          # 学生姓名 (可选)
+    server_url: str = "http://localhost:8080"       # 教师服务器地址
+    server_port: int = 8080                         # 教师服务器端口 (Hub 模式)
+    server_host: str = "0.0.0.0"                    # 教师服务器监听地址
+    is_hub: bool = False                            # 本机是否运行教师服务器
+    heartbeat_interval: float = 2.0                 # 心跳间隔 (秒)
+    thumbnail_quality: int = 70                     # 缩略图 JPEG 质量
+    thumbnail_size: tuple = (160, 120)              # 缩略图分辨率
+
+    def __post_init__(self):
+        self.enabled = os.environ.get(
+            "LG_CLASSROOM", str(self.enabled)
+        ).lower() in ("true", "1", "yes")
+        self.station_id = os.environ.get("LG_STATION_ID", self.station_id)
+        self.student_name = os.environ.get("LG_STUDENT_NAME", self.student_name)
+        self.server_url = os.environ.get("LG_SERVER_URL", self.server_url)
+        self.server_port = int(os.environ.get("LG_SERVER_PORT", self.server_port))
+        self.is_hub = os.environ.get(
+            "LG_IS_HUB", str(self.is_hub)
+        ).lower() in ("true", "1", "yes")
+
+        # 自动生成 station_id
+        if not self.station_id:
+            import socket
+            self.station_id = socket.gethostname()[:12]
+
+
+# ============================================================
 # 检测类别定义
 # ============================================================
 
@@ -333,6 +408,12 @@ class CircuitConfig:
     topology_match_check_polarity: bool = True  # VF2++ 匹配时是否检查极性
     position_tolerance_rows: int = 2       # 位置启发式匹配的行容差
 
+    # --- 引脚遮挡补偿 ---
+    pin_candidate_k: int = 3              # 每个引脚返回的候选孔洞数量
+    pin_same_group_penalty: float = 100.0  # 两引脚在同一导通组的惩罚分
+    pin_same_row_penalty: float = 50.0     # 非Wire元件两引脚在同一行的惩罚分
+    pin_large_span_threshold: int = 10     # 行跨度 > 此值视为异常
+
     # --- 网表导出 ---
     netlist_include_confidence: bool = True  # 网表中是否包含置信度
     netlist_format: str = "json"            # 导出格式: "json" | "spice_like"
@@ -350,6 +431,7 @@ ocr = OCRConfig()
 gui = GUIConfig()
 circuit = CircuitConfig()
 rag = RAGConfig()
+classroom = ClassroomConfig()
 
 
 # ============================================================
@@ -418,4 +500,6 @@ def print_config_summary():
     print(f"  Vision:      conf={vision.conf_threshold}, imgsz={vision.imgsz}")
     print(f"  LLM:         cloud={llm.use_cloud}, ready={llm.is_cloud_ready}")
     print(f"  Calibration: rows={calibration.rows}, output={calibration.output_size}")
+    if classroom.enabled:
+        print(f"  Classroom:   station={classroom.station_id}, hub={classroom.is_hub}, server={classroom.server_url}")
     print("=" * 50)

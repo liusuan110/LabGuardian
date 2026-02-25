@@ -3,18 +3,25 @@ QThread 工作线程
 职责: 将耗时操作从主线程解耦, 通过信号驱动 UI 更新
 
 线程:
-  - VideoWorker:  摄像头采集 → 帧处理 → 发送 QPixmap
-  - ModelLoader:  后台加载 YOLO / LLM 模型
-  - LLMWorker:    异步 LLM 问答
+  - VideoWorker:      摄像头采集 → 帧处理 → 发送 QPixmap
+  - ModelLoader:      后台加载 YOLO / LLM 模型
+  - LLMWorker:        异步 LLM 问答
+  - HeartbeatWorker:  课堂模式心跳上报 + 教师指导接收
 """
 
 import cv2
 import time
 import traceback
+import logging
+import base64
+import json
+import threading
 import numpy as np
 from PySide6.QtCore import QThread, Signal, QMutex, QMutexLocker, Slot
 from PySide6.QtGui import QImage, QPixmap
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 
 class VideoWorker(QThread):
@@ -218,3 +225,244 @@ class LLMWorker(QThread):
             self.response_ready.emit(answer)
         except Exception as e:
             self.error.emit(f"AI 回复错误: {e}")
+
+
+class HeartbeatWorker(QThread):
+    """
+    课堂模式心跳工作线程
+
+    职责:
+      1. 每 N 秒从 AppContext 采集电路状态, POST 到教师服务器
+      2. 维护 WebSocket 连接, 接收教师指导消息
+      3. 通过信号通知主线程显示 Toast
+
+    信号:
+      guidance_received(str, str, str):  (type, message, sender) 教师指导
+      connection_status(bool):           服务器连接状态
+    """
+    guidance_received = Signal(str, str, str)   # (type, message, sender)
+    connection_status = Signal(bool)            # True=connected
+
+    def __init__(self, ctx, station_id: str, server_url: str,
+                 interval: float = 2.0, thumbnail_size: tuple = (160, 120),
+                 thumbnail_quality: int = 70, student_name: str = ""):
+        super().__init__()
+        self.ctx = ctx
+        self.station_id = station_id
+        self.student_name = student_name
+        self.server_url = server_url.rstrip("/")
+        self.interval = interval
+        self.thumb_size = thumbnail_size
+        self.thumb_quality = thumbnail_quality
+        self._running = True
+
+        # 最新帧 (由主线程写入)
+        self._frame_lock = threading.Lock()
+        self._latest_frame = None
+        self._latest_fps = 0.0
+
+    def update_frame(self, frame: np.ndarray):
+        """由主线程调用, 更新最新帧 (用于生成缩略图)"""
+        with self._frame_lock:
+            self._latest_frame = frame
+
+    def update_fps(self, fps: float):
+        """由主线程调用, 更新 FPS"""
+        self._latest_fps = fps
+
+    def stop(self):
+        self._running = False
+        self.wait(5000)
+
+    def run(self):
+        """主循环: 心跳上报 + WebSocket 监听"""
+        # 延迟导入 (requests 是轻量依赖)
+        try:
+            import requests
+        except ImportError:
+            logger.error("[Heartbeat] requests 未安装, 心跳上报不可用")
+            return
+
+        # 启动 WebSocket 监听线程
+        ws_thread = threading.Thread(
+            target=self._ws_listener,
+            daemon=True,
+            name="HeartbeatWS",
+        )
+        ws_thread.start()
+
+        while self._running:
+            try:
+                payload = self._build_heartbeat()
+                resp = requests.post(
+                    f"{self.server_url}/api/heartbeat",
+                    json=payload,
+                    timeout=2,
+                )
+                if resp.status_code == 200:
+                    self.connection_status.emit(True)
+                else:
+                    self.connection_status.emit(False)
+            except Exception as e:
+                logger.debug(f"[Heartbeat] 上报失败: {e}")
+                self.connection_status.emit(False)
+
+            time.sleep(self.interval)
+
+    def _build_heartbeat(self) -> dict:
+        """从 AppContext 采集数据, 构建心跳包"""
+        # 延迟导入 shared 模块
+        import sys as _sys
+        _lab_root = str(Path(__file__).resolve().parent.parent.parent)
+        if _lab_root not in _sys.path:
+            _sys.path.insert(0, _lab_root)
+
+        from shared.models import StationHeartbeat, ComponentInfo
+        from shared.risk import classify_risk
+
+        ctx = self.ctx
+
+        # ---- 从 AppContext 安全读取 ----
+        components = []
+        component_count = 0
+        net_count = 0
+        circuit_snapshot = ""
+        diagnostics = []
+        progress = 0.0
+        similarity = 0.0
+        missing_components = []
+        detector_ok = False
+        llm_backend = ""
+        ocr_backend = ""
+
+        try:
+            with ctx.read_lock():
+                component_count = len(ctx.analyzer.components)
+                for comp in ctx.analyzer.components:
+                    components.append(ComponentInfo(
+                        name=comp.name,
+                        type=comp.type,
+                        polarity=comp.polarity.value if hasattr(comp.polarity, 'value') else str(comp.polarity),
+                        pin1=list(comp.pin1_loc) if comp.pin1_loc else [],
+                        pin2=list(comp.pin2_loc) if comp.pin2_loc else [],
+                        pin3=list(comp.pin3_loc) if comp.pin3_loc else [],
+                        confidence=comp.confidence,
+                    ).model_dump())
+
+                # 网络数
+                import networkx as _nx
+                net_count = _nx.number_connected_components(ctx.analyzer.graph)
+
+            # 电路快照 (无需持有 lock, 使用 snapshot)
+            circuit_snapshot = ctx.get_circuit_snapshot()[:500]
+
+            # 诊断
+            try:
+                from logic.validator import CircuitValidator
+                with ctx.read_lock():
+                    diagnostics = CircuitValidator.diagnose(ctx.analyzer)
+            except Exception:
+                pass
+
+            # 验证进度
+            try:
+                if ctx.validator.has_reference:
+                    with ctx.read_lock():
+                        result = ctx.validator.compare(ctx.analyzer)
+                        progress = result.get("progress", 0.0)
+                        similarity = result.get("similarity", 0.0)
+                        missing_components = result.get("missing_components", [])
+            except Exception:
+                pass
+
+            # 系统状态
+            detector_ok = ctx.detector.model is not None
+            llm_backend = getattr(ctx.llm, 'current_backend', '')
+            ocr_backend = getattr(ctx.ocr, 'backend_name', '')
+
+        except Exception as e:
+            logger.debug(f"[Heartbeat] 数据采集异常: {e}")
+
+        # 风险分级
+        risk_level_enum, risk_reasons = classify_risk(diagnostics)
+
+        # 缩略图
+        thumbnail_b64 = ""
+        with self._frame_lock:
+            frame = self._latest_frame
+        if frame is not None:
+            try:
+                thumb = cv2.resize(frame, self.thumb_size)
+                _, buf = cv2.imencode(
+                    '.jpg', thumb,
+                    [cv2.IMWRITE_JPEG_QUALITY, self.thumb_quality]
+                )
+                thumbnail_b64 = base64.b64encode(buf.tobytes()).decode('ascii')
+            except Exception:
+                pass
+
+        heartbeat = StationHeartbeat(
+            station_id=self.station_id,
+            student_name=self.student_name,
+            component_count=component_count,
+            net_count=net_count,
+            components=components,
+            progress=progress,
+            similarity=similarity,
+            missing_components=missing_components,
+            diagnostics=diagnostics,
+            risk_level=risk_level_enum.value,
+            risk_reasons=risk_reasons,
+            circuit_snapshot=circuit_snapshot,
+            fps=self._latest_fps,
+            detector_ok=detector_ok,
+            llm_backend=llm_backend,
+            ocr_backend=ocr_backend,
+            thumbnail_b64=thumbnail_b64,
+        )
+        return heartbeat.model_dump()
+
+    def _ws_listener(self):
+        """WebSocket 监听线程: 接收教师指导消息"""
+        try:
+            import websocket
+        except ImportError:
+            # websocket-client 未安装, 回退到轮询模式
+            logger.info("[Heartbeat] websocket-client 未安装, 跳过 WS 监听")
+            return
+
+        ws_url = self.server_url.replace("http://", "ws://").replace("https://", "wss://")
+        ws_url = f"{ws_url}/ws/station/{self.station_id}"
+
+        while self._running:
+            try:
+                ws = websocket.WebSocket()
+                ws.settimeout(5)
+                ws.connect(ws_url)
+                logger.info(f"[Heartbeat] WebSocket 已连接: {ws_url}")
+
+                while self._running:
+                    try:
+                        msg = ws.recv()
+                        if msg:
+                            data = json.loads(msg)
+                            msg_type = data.get("type", "hint")
+                            message = data.get("message", "")
+                            sender = data.get("sender", "Teacher")
+                            self.guidance_received.emit(msg_type, message, sender)
+                    except websocket.WebSocketTimeoutException:
+                        # 超时无消息, 发送 ping
+                        try:
+                            ws.send("ping")
+                        except Exception:
+                            break
+                    except Exception:
+                        break
+
+                ws.close()
+            except Exception as e:
+                logger.debug(f"[Heartbeat] WebSocket 连接失败: {e}")
+
+            # 重连等待
+            if self._running:
+                time.sleep(5)

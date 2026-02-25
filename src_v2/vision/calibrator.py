@@ -49,6 +49,9 @@ class BreadboardCalibrator:
         self.width = 0
         self.height = 0
 
+        # 原始帧中面包板的 4 个角点 (TL, TR, BR, BL), 用于 ROI 计算
+        self._src_corners: Optional[np.ndarray] = None
+
         # 孔洞网格
         self.hole_centers: List[Tuple[float, float]] = []
         self.row_centers: Optional[np.ndarray] = None
@@ -59,6 +62,7 @@ class BreadboardCalibrator:
         self.matrix = None
         self.width = 0
         self.height = 0
+        self._src_corners = None
         self.reset_holes()
 
     def reset_holes(self):
@@ -78,15 +82,18 @@ class BreadboardCalibrator:
     def calibrate(self, src_points: np.ndarray) -> Optional[np.ndarray]:
         """
         根据 4 个角点计算透视变换矩阵
-        
+
         Args:
             src_points: 形状 (4,2) 的点阵, 顺序: 左上→右上→右下→左下
-            
+
         Returns:
             变换矩阵, 或 None (失败)
         """
         if len(src_points) != 4:
             return None
+
+        # 保存原始角点 (用于 ROI 计算)
+        self._src_corners = np.float32(src_points).copy()
 
         w, h = self.output_size
         dst_points = np.array([
@@ -592,6 +599,78 @@ class BreadboardCalibrator:
         idx = int(np.argmin(dx * dx + dy * dy))
         return (float(pts[idx, 0]), float(pts[idx, 1]))
 
+    def top_k_holes(self, wx: float, wy: float, k: int = 3
+                    ) -> List[Tuple[Tuple[float, float], float]]:
+        """返回距离最近的 K 个孔洞及其距离 (矫正坐标系)。
+
+        当元件遮挡引脚时, 估计坐标可能偏离真实孔洞。
+        返回多个候选, 供下游约束排序选择最优。
+
+        Args:
+            wx, wy: 矫正坐标系中的查询点
+            k: 返回候选数量
+
+        Returns:
+            [((hx, hy), distance), ...] 按距离升序排列
+        """
+        if not self.hole_centers:
+            return []
+
+        pts = np.array(self.hole_centers, dtype=np.float32)
+        dx = pts[:, 0] - float(wx)
+        dy = pts[:, 1] - float(wy)
+        dists = np.sqrt(dx * dx + dy * dy)
+
+        k = min(k, len(pts))
+        indices = np.argpartition(dists, k)[:k]
+        indices = indices[np.argsort(dists[indices])]
+
+        return [
+            ((float(pts[idx, 0]), float(pts[idx, 1])), float(dists[idx]))
+            for idx in indices
+        ]
+
+    def frame_pixel_to_logic_candidates(
+        self, px: float, py: float, k: int = 3
+    ) -> List[Tuple[Tuple[str, str], float]]:
+        """从原始帧像素坐标映射到 K 个候选逻辑坐标。
+
+        先透视变换 → 再查找 Top-K 最近孔洞 → 各自映射为逻辑坐标。
+        候选中去除重复的逻辑坐标 (不同孔洞可能映射到同一格位)。
+
+        Args:
+            px, py: 原始帧中的像素坐标
+            k: 候选数量
+
+        Returns:
+            [((row_str, col_char), distance), ...] 按距离升序, 去重
+        """
+        if self.matrix is None:
+            return []
+
+        src_point = np.array([[[px, py]]], dtype=np.float32)
+        dst_point = cv2.perspectiveTransform(src_point, self.matrix)
+        wx, wy = dst_point[0][0]
+
+        candidates = self.top_k_holes(wx, wy, k=k)
+        results = []
+        seen = set()
+        for (hx, hy), dist in candidates:
+            loc = self.hole_to_logic(hx, hy)
+            if loc is not None and loc[0] != "Groove":
+                key = (loc[0], loc[1])
+                if key not in seen:
+                    seen.add(key)
+                    results.append((loc, dist))
+
+        # 无孔洞候选时回退到线性映射
+        if not results:
+            loc = self.pixel_to_logic(wx, wy)
+            if loc is not None:
+                results.append((loc, 0.0))
+
+        return results
+
     def hole_to_logic(self, hx: float, hy: float):
         """将孔洞中心 (矫正坐标) 映射到逻辑坐标"""
         if self.row_centers is None or self.col_centers is None:
@@ -619,6 +698,117 @@ class BreadboardCalibrator:
             end = (i + 1) * bin_size if i < bins - 1 else n
             centers.append(float(np.median(values[start:end])))
         return np.array(centers, dtype=np.float32)
+
+    # ========================================================
+    # 自动面包板检测 + ROI
+    # ========================================================
+
+    def auto_detect_board(self, frame: np.ndarray) -> Optional[np.ndarray]:
+        """
+        自动检测面包板矩形区域, 返回 4 个角点 (TL, TR, BR, BL)
+
+        算法: Canny 边缘 → 膨胀连接 → 轮廓检测 → 最大四边形筛选
+
+        Args:
+            frame: BGR 图像
+
+        Returns:
+            (4,2) np.ndarray 角点坐标, 或 None (未检测到)
+        """
+        h, w = frame.shape[:2]
+        min_area = h * w * 0.05  # 面包板至少占画面 5%
+
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        blurred = cv2.GaussianBlur(gray, (11, 11), 0)
+
+        # 多组 Canny 阈值尝试 (适应不同光照)
+        for low, high in [(30, 100), (50, 150), (80, 200)]:
+            edges = cv2.Canny(blurred, low, high)
+            kernel = np.ones((3, 3), np.uint8)
+            edges = cv2.dilate(edges, kernel, iterations=2)
+
+            contours, _ = cv2.findContours(
+                edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+            )
+            contours = sorted(contours, key=cv2.contourArea, reverse=True)
+
+            for cnt in contours[:10]:
+                area = cv2.contourArea(cnt)
+                if area < min_area:
+                    continue
+
+                peri = cv2.arcLength(cnt, True)
+                approx = cv2.approxPolyDP(cnt, 0.02 * peri, True)
+
+                if len(approx) == 4:
+                    corners = approx.reshape(4, 2).astype(np.float32)
+                    ordered = self._order_corners(corners)
+                    logger.info(f"[AutoDetect] 检测到面包板: area={area:.0f}, "
+                                f"corners={ordered.tolist()}")
+                    return ordered
+
+        logger.warning("[AutoDetect] 未能自动检测到面包板矩形")
+        return None
+
+    @staticmethod
+    def _order_corners(pts: np.ndarray) -> np.ndarray:
+        """
+        将 4 个角点排序为 TL, TR, BR, BL 顺序
+
+        方法: 按 x+y 之和区分 TL(最小) 和 BR(最大),
+              按 x-y 之差区分 TR(最大) 和 BL(最小)
+        """
+        rect = np.zeros((4, 2), dtype=np.float32)
+        s = pts.sum(axis=1)       # x + y
+        d = np.diff(pts, axis=1).flatten()  # x - y
+
+        rect[0] = pts[np.argmin(s)]   # TL: x+y 最小
+        rect[2] = pts[np.argmax(s)]   # BR: x+y 最大
+        rect[1] = pts[np.argmax(d)]   # TR: x-y 最大
+        rect[3] = pts[np.argmin(d)]   # BL: x-y 最小
+        return rect
+
+    def get_roi_rect(self, frame_shape: tuple, padding: int = 30
+                     ) -> Optional[Tuple[int, int, int, int]]:
+        """
+        从校准角点计算带 padding 的轴对齐 ROI 矩形
+
+        Args:
+            frame_shape: (height, width, ...) 原始帧 shape
+            padding: 外扩像素 (防止边缘元件被截断)
+
+        Returns:
+            (x1, y1, x2, y2) 或 None
+        """
+        if self._src_corners is None:
+            return None
+
+        xs = self._src_corners[:, 0]
+        ys = self._src_corners[:, 1]
+        x1 = max(0, int(np.min(xs)) - padding)
+        y1 = max(0, int(np.min(ys)) - padding)
+        x2 = min(frame_shape[1], int(np.max(xs)) + padding)
+        y2 = min(frame_shape[0], int(np.max(ys)) + padding)
+        return (x1, y1, x2, y2)
+
+    def auto_calibrate(self, frame: np.ndarray) -> bool:
+        """
+        一步到位: 自动检测面包板 → 透视校准 → 孔洞检测
+
+        Args:
+            frame: BGR 图像
+
+        Returns:
+            True = 成功, False = 未检测到面包板
+        """
+        corners = self.auto_detect_board(frame)
+        if corners is None:
+            return False
+        self.calibrate(corners)
+        warped = self.warp(frame)
+        self.detect_holes(warped)
+        logger.info(f"[AutoCalibrate] 完成: {len(self.hole_centers)} 孔洞")
+        return True
 
 
 # 全局单例

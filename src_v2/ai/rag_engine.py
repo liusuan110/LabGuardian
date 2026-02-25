@@ -252,19 +252,37 @@ class RAGEngine:
 
         优先级:
           1. 本地缓存目录 (models/text2vec_chinese/)
-          2. HuggingFace text2vec-base-chinese (中文最优)
-          3. all-MiniLM-L6-v2 (英文回退, 体积小)
+          2. HuggingFace text2vec-base-chinese (需联网, 竞赛模式跳过)
+          3. all-MiniLM-L6-v2 (英文回退, 需联网, 竞赛模式跳过)
+
+        竞赛模式下:
+          仅使用本地已缓存的模型, 不尝试任何网络下载
         """
         from chromadb.utils import embedding_functions
 
-        # 尝试 1: 本地缓存的中文模型
+        # 检查是否处于竞赛离线模式
+        try:
+            from config import llm as _llm_cfg
+            is_competition = _llm_cfg.competition_mode
+        except Exception:
+            is_competition = False
+
+        # 尝试 1: 本地缓存的中文模型 (离线首选)
         if EMBEDDING_MODEL_DIR.exists():
             logger.info(f"[RAG] 使用本地 Embedding 模型: {EMBEDDING_MODEL_DIR}")
             return embedding_functions.SentenceTransformerEmbeddingFunction(
                 model_name=str(EMBEDDING_MODEL_DIR)
             )
 
-        # 尝试 2: 从 HuggingFace 加载中文模型
+        # 竞赛模式下不尝试联网下载
+        if is_competition:
+            raise RuntimeError(
+                f"[RAG] 竞赛离线模式: 本地 Embedding 模型不存在 ({EMBEDDING_MODEL_DIR})。"
+                f"请在有网环境预下载: python -c \"from sentence_transformers import SentenceTransformer; "
+                f"SentenceTransformer('{self._embedding_model_name}').save('{EMBEDDING_MODEL_DIR}')\""
+            )
+
+        # 尝试 2: 从 HuggingFace 加载中文模型 (仅联网模式)
         try:
             logger.info(f"[RAG] 加载 Embedding 模型: {self._embedding_model_name}")
             ef = embedding_functions.SentenceTransformerEmbeddingFunction(

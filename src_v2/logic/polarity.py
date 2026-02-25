@@ -26,7 +26,8 @@ from typing import Optional, Tuple, List
 
 from .circuit import (
     CircuitComponent, Polarity, PinRole,
-    POLARIZED_TYPES, THREE_PIN_TYPES, NON_POLAR_TYPES,
+    POLARIZED_TYPES, THREE_PIN_TYPES, NON_POLAR_TYPES, CAPACITOR_TYPES,
+    norm_component_type,
 )
 
 logger = logging.getLogger(__name__)
@@ -150,8 +151,11 @@ class PolarityResolver:
                                  orientation_deg: float):
         """三极管 (NPN/PNP) 引脚推断。
 
-        TO-92 封装约定: 从平面侧看，左→右 = E / B / C。
-        只有当元件跨 ≥33 行时才能可靠推断引脚。
+        TO-92 封装约定: 从平面侧看, 左→右 = E / B / C。
+
+        pin3_loc 获取策略:
+          1. 优先: 视觉检测 (main_window._find_transistor_pin3 已设置 comp.pin3_loc)
+          2. 回退: 行号中点插值 (row_span ≥ 2 时)
         """
         if comp.pin1_loc is None or comp.pin2_loc is None:
             comp.polarity = Polarity.UNKNOWN
@@ -170,14 +174,27 @@ class PolarityResolver:
 
         row_span = abs(row2 - row1)
 
-        if row_span >= 2:
-            # 跨 ≥ 3 行，中间行为基极 (B)，按行号顺序分配 E/B/C
-            mid_row = (row1 + row2) // 2 if row1 < row2 else (row2 + row1) // 2
+        # pin3_loc: 优先使用视觉检测结果, 否则回退到中点插值
+        has_visual_pin3 = comp.pin3_loc is not None
+
+        if has_visual_pin3 or row_span >= 2:
             min_row = min(row1, row2)
             max_row = max(row1, row2)
 
-            # 推断第三引脚位置（中间行）
-            comp.pin3_loc = (str(mid_row), col1)
+            if has_visual_pin3:
+                # 视觉检测已设置 pin3_loc, 保留不覆盖
+                try:
+                    mid_row = int(comp.pin3_loc[0])
+                except (ValueError, TypeError):
+                    mid_row = (row1 + row2) // 2
+                logger.info(f"[Polarity] {comp.name}: pin3 from visual detection "
+                            f"at row {comp.pin3_loc}")
+            else:
+                # 回退: 行号中点插值
+                mid_row = (min_row + max_row) // 2
+                comp.pin3_loc = (str(mid_row), col1)
+                logger.info(f"[Polarity] {comp.name}: pin3 fallback to midpoint "
+                            f"row {mid_row}")
 
             # 默认约定: pin1(小行号)=E, mid=B, pin2(大行号)=C
             if row1 < row2:
@@ -190,7 +207,7 @@ class PolarityResolver:
                         f"rows {min_row}/{mid_row}/{max_row}, span={row_span}")
             self.stats['resolved'] += 1
         else:
-            # 跨行不足, 无法可靠分配引脚
+            # 跨行不足且无视觉 pin3, 无法可靠分配引脚
             comp.polarity = Polarity.UNKNOWN
             comp.pin_roles = (PinRole.GENERIC, PinRole.GENERIC)
             logger.warning(f"[Polarity] {comp.name}: Transistor row span={row_span}, "
@@ -249,27 +266,8 @@ class PolarityResolver:
 
     @staticmethod
     def _norm_type(t: str) -> str:
-        """归一化元件类型名"""
-        if not t:
-            return "UNKNOWN"
-        u = str(t).strip().upper()
-        if "RESIST" in u:
-            return "RESISTOR"
-        if "WIRE" in u:
-            return "WIRE"
-        if "LED" in u:
-            return "LED"
-        if "DIODE" in u:
-            return "DIODE"
-        if "BUTTON" in u or "SWITCH" in u:
-            return "Push_Button"
-        if "CAP" in u:
-            return "CAPACITOR"
-        if "NPN" in u or "PNP" in u or "TRANSISTOR" in u or "BJT" in u:
-            return "TRANSISTOR"
-        if "BATTERY" in u or "POWER" in u:
-            return "POWER"
-        return u
+        """归一化元件类型名 (委托给模块级函数)"""
+        return norm_component_type(t)
 
     def get_stats_summary(self) -> str:
         """返回极性推断统计"""

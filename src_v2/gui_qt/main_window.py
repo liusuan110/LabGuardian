@@ -2,6 +2,11 @@
 LabGuardian 主窗口 (PySide6)
 PyDracula 风格: 侧边栏 + 多页面路由 + 自定义标题栏
 
+架构 (v4 — 模块拆分):
+  - 帧处理管线提取至 frame_pipeline.FramePipeline (纯计算, 无 Qt 依赖)
+  - 校准交互提取至 calibration.CalibrationHelper
+  - MainWindow 仅负责 UI 编排 / 信号连接 / 用户操作回调
+
 布局:
   ┌──────────────────────────────────────────────────┐
   │  自定义标题栏 (拖拽移动, 最小化/最大化/关闭)      │
@@ -20,9 +25,7 @@ PyDracula 风格: 侧边栏 + 多页面路由 + 自定义标题栏
 """
 
 import sys
-import traceback
-import numpy as np
-import cv2
+import logging
 from pathlib import Path
 
 from PySide6.QtWidgets import (
@@ -38,17 +41,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from config import (
     gui as gui_cfg, vision as vision_cfg,
-    camera as cam_cfg, circuit as circuit_cfg,
+    camera as cam_cfg,
+    classroom as classroom_cfg,
 )
-from vision.detector import ComponentDetector
-from vision.calibrator import board_calibrator
-from vision.stabilizer import DetectionStabilizer
-from logic.circuit import CircuitAnalyzer, CircuitComponent
-from logic.polarity import polarity_resolver
-from logic.validator import validator
-from logic.schematic import SchematicGenerator
-from ai.llm_engine import LLMEngine
-from ai.ocr_engine import OCREngine, OCR_TARGET_CLASSES
+from app_context import AppContext
 
 from .styles import GLOBAL_STYLE, ACCENT, BG_DARK, BG_MEDIUM, BORDER, TEXT, TEXT_DIM, SUCCESS, WARNING, DANGER
 from .resources import Icons
@@ -59,6 +55,10 @@ from .dashboard import Dashboard
 from .circuit_page import CircuitPage
 from .settings_page import SettingsPage
 from .workers import VideoWorker, ModelLoaderWorker, LLMWorker
+from .frame_pipeline import FramePipeline
+from .calibration import CalibrationHelper
+
+logger = logging.getLogger(__name__)
 
 
 # ============================================================
@@ -148,7 +148,7 @@ class MainWindow(QMainWindow):
     """
     LabGuardian 主窗口
 
-    架构:
+    架构 (v4 — 模块拆分):
       TitleBar
       ├── Sidebar (导航)
       └── QStackedWidget
@@ -157,10 +157,18 @@ class MainWindow(QMainWindow):
             ├── page_chat    (ChatPanel 全屏)
             ├── page_circuit (CircuitPage)
             └── page_settings(SettingsPage)
+
+    职责划分:
+      - FramePipeline:      帧处理 / OCR / 坐标映射 / 电路分析 (纯计算)
+      - CalibrationHelper:  面包板校准交互 (OpenCV 窗口 + 自动检测)
+      - MainWindow:         UI 编排 / 信号连接 / 用户操作回调
     """
 
-    def __init__(self):
+    def __init__(self, ctx: AppContext = None):
         super().__init__()
+
+        # ---- AppContext (核心服务注册中心) ----
+        self.ctx = ctx if ctx is not None else AppContext()
 
         # 无边框窗口
         self.setWindowFlags(
@@ -171,27 +179,47 @@ class MainWindow(QMainWindow):
         self.resize(gui_cfg.window_size[0], gui_cfg.window_size[1])
         self.setWindowTitle(gui_cfg.window_title)
 
-        # 核心模块
-        self.detector = ComponentDetector()
-        self.stabilizer = DetectionStabilizer(window_size=5, min_hits=3)
-        self.analyzer = CircuitAnalyzer()
-        self.llm = LLMEngine()
-        self.ocr = OCREngine()
-
-        # OCR 结果缓存 (class_name -> chip_model, 避免每帧重复 OCR)
-        self._ocr_cache: dict = {}      # {"IC_row15": "NE555"}
-        self._ocr_frame_skip = 0        # 跳帧计数 (OCR 比较慢, 每 N 帧执行一次)
-        self._ocr_interval = 30         # 每 30 帧执行一次 OCR
-
-        # 状态
-        self.current_detection = "None"
-        self.ar_missing_links = []
+        # ---- 帧处理管线 + 校准辅助 ----
+        self._pipeline = FramePipeline(self.ctx)
+        self._calibration = CalibrationHelper(self.ctx)
 
         self._setup_ui()
         self._connect_signals()
+        self._connect_pipeline_callbacks()
 
         # 后台加载模型
         self._start_model_loading()
+
+    # ================================================================
+    # 管线回调连接
+    # ================================================================
+
+    def _connect_pipeline_callbacks(self):
+        """连接 FramePipeline / CalibrationHelper 的回调到 UI"""
+        self._pipeline.on_log = self._log_all
+        self._pipeline.on_rag_result = self._on_rag_result
+        self._pipeline.on_frame_processed = self._on_pipeline_frame
+
+        self._calibration.on_log = self._log_all
+        self._calibration.on_status = self._dashboard.update_module_status
+
+    def _on_rag_result(self, chip_model: str, detail: str, short: str):
+        """FramePipeline OCR+RAG 回调 → 推送到聊天面板"""
+        self._chat_panel.add_message(detail, "system")
+        self._chat_side.add_message(short, "system")
+
+    def _on_pipeline_frame(self, annotated):
+        """FramePipeline 处理完帧的回调 → 喂给心跳线程"""
+        if hasattr(self, '_heartbeat_worker'):
+            self._heartbeat_worker.update_frame(annotated)
+
+    @property
+    def current_detection(self):
+        return self._pipeline.current_detection
+
+    @current_detection.setter
+    def current_detection(self, value):
+        self._pipeline.current_detection = value
 
     # ================================================================
     # UI 搭建
@@ -313,7 +341,7 @@ class MainWindow(QMainWindow):
         self._settings_page = SettingsPage()
         self._stack.addWidget(self._settings_page)
 
-        # 页面名→索引映射
+        # 页面名->索引映射
         self._page_map = {
             "home":     0,
             "video":    1,
@@ -351,8 +379,11 @@ class MainWindow(QMainWindow):
         self._circuit_page.load_template_requested.connect(self._load_template)
         self._circuit_page.validate_requested.connect(self._validate_circuit)
         self._circuit_page.show_netlist_requested.connect(self._show_netlist)
-        self._circuit_page.draw_schematic_requested.connect(self._draw_schematic)
         self._circuit_page.reset_requested.connect(self._reset_analyzer)
+
+        # ---- 课堂模式: 心跳上报 + 教师指导接收 ----
+        if classroom_cfg.enabled:
+            self._init_classroom()
 
     # ================================================================
     # 页面切换
@@ -374,7 +405,9 @@ class MainWindow(QMainWindow):
     # ================================================================
 
     def _start_model_loading(self):
-        self._model_loader = ModelLoaderWorker(self.detector, self.llm, self.ocr)
+        self._model_loader = ModelLoaderWorker(
+            self.ctx.detector, self.ctx.llm, self.ctx.ocr
+        )
         self._model_loader.progress.connect(self._on_model_progress)
         self._model_loader.finished.connect(self._on_model_loaded)
         self._model_loader.start()
@@ -400,8 +433,8 @@ class MainWindow(QMainWindow):
             self._dashboard.update_system_status("部分就绪", WARNING)
 
         # 检测 LLM 状态
-        if self.llm._active:
-            backend_name = self.llm.backend_name
+        if self.ctx.llm._active:
+            backend_name = self.ctx.llm.backend_name
             self._dashboard.update_module_status("llm", True, backend_name)
             self._sb_llm.setText(f"LLM: {backend_name}")
             self._sb_llm.setStyleSheet(f"color: {SUCCESS}; font-size: 11px;")
@@ -410,18 +443,71 @@ class MainWindow(QMainWindow):
             self._chat_side.set_ai_status(f"{Icons.OK} {backend_name}", SUCCESS)
 
         # OCR 状态
-        if self.ocr.is_ready:
-            self._dashboard.update_module_status("ocr", True, f"OCR: {self.ocr.backend_name}")
-            self._dashboard.add_log(f"✅ OCR 丝印识别引擎: {self.ocr.backend_name}")
+        if self.ctx.ocr.is_ready:
+            self._dashboard.update_module_status("ocr", True, f"OCR: {self.ctx.ocr.backend_name}")
+            self._dashboard.add_log(f"OCR 丝印识别引擎: {self.ctx.ocr.backend_name}")
         else:
             self._dashboard.update_module_status("ocr", False, "OCR: 未加载")
 
         # RAG 状态
-        if self.llm.rag_ready:
-            self._dashboard.update_module_status("rag", True, f"RAG: {self.llm.rag.doc_count} 知识块")
+        if self.ctx.llm.rag_ready:
+            self._dashboard.update_module_status("rag", True, f"RAG: {self.ctx.llm.rag.doc_count} 知识块")
 
         # 启动视频线程
         self._start_video()
+
+    # ================================================================
+    # 课堂模式 (心跳上报 + 教师指导接收)
+    # ================================================================
+
+    def _init_classroom(self):
+        """初始化课堂模式: 启动心跳线程 + Toast 通知"""
+        from .workers import HeartbeatWorker
+        from .toast import ToastNotification
+
+        # Toast 通知 (挂在 centralWidget 上, 顶部滑入)
+        self._toast = ToastNotification(self.centralWidget())
+        self._toast.setFixedWidth(500)
+
+        # 心跳工作线程
+        self._heartbeat_worker = HeartbeatWorker(
+            ctx=self.ctx,
+            station_id=classroom_cfg.station_id,
+            server_url=classroom_cfg.server_url,
+            interval=classroom_cfg.heartbeat_interval,
+            thumbnail_size=classroom_cfg.thumbnail_size,
+            thumbnail_quality=classroom_cfg.thumbnail_quality,
+            student_name=classroom_cfg.student_name,
+        )
+
+        # 教师指导 → Toast 弹窗
+        self._heartbeat_worker.guidance_received.connect(self._on_guidance_received)
+        # 连接状态 → 状态栏
+        self._heartbeat_worker.connection_status.connect(self._on_classroom_connection)
+
+        self._heartbeat_worker.start()
+        self._dashboard.add_log(f"课堂模式就绪: 工位 {classroom_cfg.station_id}")
+        logger.info(f"[Classroom] HeartbeatWorker 已启动, station={classroom_cfg.station_id}")
+
+    @Slot(str, str, str)
+    def _on_guidance_received(self, msg_type: str, message: str, sender: str):
+        """教师指导消息 → Toast 弹窗 + 聊天面板"""
+        if hasattr(self, '_toast'):
+            self._toast.show_message(msg_type, message, sender)
+
+        # 同时显示在聊天面板
+        prefix = {"hint": "💡", "warning": "⚠️", "approve": "✅"}.get(msg_type, "📢")
+        self._chat_panel.log(f"{prefix} [{sender}] {message}")
+        self._chat_side.log(f"{prefix} [{sender}] {message}")
+        self._dashboard.add_log(f"教师指导: {message[:50]}")
+
+    @Slot(bool)
+    def _on_classroom_connection(self, connected: bool):
+        """课堂服务器连接状态更新"""
+        if connected:
+            self._sb_status.setText(f"☁ 课堂已连接")
+            self._sb_status.setStyleSheet(f"color: {SUCCESS}; font-size: 11px;")
+        # 不在断开时覆盖状态 (避免频繁闪烁)
 
     # ================================================================
     # 视频管线
@@ -432,7 +518,7 @@ class MainWindow(QMainWindow):
             device_id=cam_cfg.device_id,
             backend=cam_cfg.cv2_backend,
         )
-        self._video_worker.set_process_callback(self._process_frame)
+        self._video_worker.set_process_callback(self._pipeline.process_frame)
 
         # 连接帧信号到两个视频面板
         self._video_worker.frame_ready.connect(self._video_panel.update_frame)
@@ -442,6 +528,10 @@ class MainWindow(QMainWindow):
 
         self._video_worker.start()
         self._dashboard.add_log("视频流已启动")
+
+        # 如果课堂模式, 把 FPS 喂给心跳线程
+        if hasattr(self, '_heartbeat_worker'):
+            self._video_worker.fps_updated.connect(self._heartbeat_worker.update_fps)
 
     @Slot(float)
     def _on_fps_updated(self, fps: float):
@@ -454,266 +544,20 @@ class MainWindow(QMainWindow):
 
     @Slot(str)
     def _on_video_error(self, msg: str):
-        self._dashboard.add_log(f"⚠️ {msg}")
+        self._dashboard.add_log(f"[Video] {msg}")
 
     def _on_conf_changed(self, value: float):
         """置信度阈值变更"""
         vision_cfg.conf_threshold = value
 
     # ================================================================
-    # 帧处理管线 (核心逻辑 — 从旧 app.py 迁移)
-    # ================================================================
-
-    def _process_frame(self, frame: np.ndarray) -> np.ndarray:
-        """
-        每帧回调: 检测 → 稳定化 → 坐标映射 → 电路分析 → 标注
-        在 VideoWorker 线程中执行
-        """
-        if not self.detector.model:
-            return frame
-
-        conf = vision_cfg.conf_threshold
-
-        # 1. YOLO 检测
-        detections = self.detector.detect(frame, conf=conf)
-
-        # 2. 多帧稳定化
-        stable_dets = self.stabilizer.update(detections)
-
-        # 3. 绘制检测结果
-        annotated = self.detector.annotate_frame(frame, stable_dets)
-
-        # 4. 坐标映射 + 电路分析
-        if board_calibrator.is_calibrated and stable_dets:
-            self.analyzer.reset()
-
-            for det in stable_dets:
-                if det.pin1_pixel and det.pin2_pixel:
-                    loc1 = board_calibrator.frame_pixel_to_logic(*det.pin1_pixel)
-                    loc2 = board_calibrator.frame_pixel_to_logic(*det.pin2_pixel)
-
-                    if (loc1 and loc2 and
-                            loc1[0] != "Groove" and loc2[0] != "Groove"):
-                        comp = CircuitComponent(
-                            name=det.class_name,
-                            type=det.class_name,
-                            pin1_loc=loc1,
-                            pin2_loc=loc2,
-                            confidence=det.confidence,
-                        )
-
-                        obb_corners = det.obb_corners if det.is_obb else None
-                        polarity_resolver.enrich(
-                            comp,
-                            obb_corners=obb_corners,
-                            orientation_deg=0.0,
-                        )
-
-                        self.analyzer.add_component(comp)
-
-                        info = f"{loc1[0]}-{loc2[0]}"
-                        x1, y1 = det.bbox[:2]
-                        cv2.putText(annotated, info, (x1, y1 - 5),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
-
-            # 网络数
-            try:
-                net_count = self.analyzer.get_net_count()
-                cv2.putText(annotated, f"Nets: {net_count}", (20, 40),
-                            cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
-                # 更新 UI (跨线程安全通过信号)
-            except Exception:
-                pass
-
-            # 幽灵线
-            self._draw_ghost_wires(annotated)
-
-        # 5. OCR 芯片丝印识别 (每 N 帧执行一次, 避免性能瓶颈)
-        self._ocr_frame_skip += 1
-        if self.ocr.is_ready and stable_dets and self._ocr_frame_skip >= self._ocr_interval:
-            self._ocr_frame_skip = 0
-            self._run_ocr_on_detections(frame, stable_dets, annotated)
-
-        # 6. 在帧上显示已识别的芯片型号
-        self._draw_ocr_labels(annotated, stable_dets)
-
-        # 7. 更新检测状态
-        comp_count = len(stable_dets) if stable_dets else 0
-        if stable_dets:
-            top = max(stable_dets, key=lambda d: d.confidence)
-            self.current_detection = top.class_name
-        else:
-            self.current_detection = "None"
-
-        return annotated
-
-    def _run_ocr_on_detections(self, frame: np.ndarray, detections: list,
-                                annotated: np.ndarray):
-        """对芯片类检测结果执行 OCR 识别丝印，新识别出型号时自动查询 RAG"""
-        target_classes = {c.upper() for c in OCR_TARGET_CLASSES}
-        for det in detections:
-            if det.class_name.upper() not in target_classes:
-                continue
-            # 使用 bbox 中心作为缓存 key (避免重复识别同一芯片)
-            cx = (det.bbox[0] + det.bbox[2]) // 2
-            cy = (det.bbox[1] + det.bbox[3]) // 2
-            cache_key = f"{cx//50}_{cy//50}"  # 量化坐标做 key
-            if cache_key in self._ocr_cache:
-                continue
-            try:
-                result = self.ocr.recognize_chip(frame, det.bbox)
-                if result.chip_model:
-                    self._ocr_cache[cache_key] = result.chip_model
-                    logger.info(f"[OCR] {det.class_name} → {result.chip_model}")
-                    # --- OCR+RAG 自动知识检索 ---
-                    self._auto_rag_lookup(result.chip_model)
-            except Exception as e:
-                logger.warning(f"[OCR] 识别出错: {e}")
-
-    def _auto_rag_lookup(self, chip_model: str):
-        """当 OCR 识别出新芯片型号时，自动查询 RAG 知识库并显示摘要"""
-        # 避免重复查询同一个型号
-        if not hasattr(self, '_rag_queried_models'):
-            self._rag_queried_models: set = set()
-        if chip_model.upper() in self._rag_queried_models:
-            return
-        self._rag_queried_models.add(chip_model.upper())
-
-        # 需要 LLM 引擎的 RAG 就绪
-        if not self.llm.rag_ready:
-            self._log_all(f"🔍 识别到芯片: {chip_model} (RAG 未就绪, 跳过知识检索)")
-            return
-
-        try:
-            # 查询 RAG 获取芯片简要信息
-            query = f"{chip_model} 引脚定义 功能 使用方法"
-            results = self.llm.rag.query(query, top_k=2, min_score=0.3)
-            if results:
-                # 取最相关片段并截取摘要
-                best = results[0]
-                snippet = best["text"][:150].replace("\n", " ").strip()
-                if len(best["text"]) > 150:
-                    snippet += "..."
-                info_msg = f"🔍 识别到 [{chip_model}] — {snippet}"
-                self._log_all(info_msg)
-                # 在聊天面板以系统消息形式推送
-                self._chat_panel.add_message(
-                    f"📦 **自动识别**: 检测到芯片 **{chip_model}**\n"
-                    f"> {snippet}\n\n"
-                    f"💡 输入 `{chip_model} 引脚` 可查看详细引脚定义",
-                    "system"
-                )
-                self._chat_side.add_message(
-                    f"📦 识别到芯片 {chip_model}: {snippet}",
-                    "system"
-                )
-                logger.info(f"[RAG] 自动检索 {chip_model}: 相关度 {best['score']:.1%}")
-            else:
-                self._log_all(f"🔍 识别到芯片: {chip_model} (知识库暂无相关信息)")
-        except Exception as e:
-            logger.warning(f"[RAG] 自动检索 {chip_model} 出错: {e}")
-
-    def _draw_ocr_labels(self, frame: np.ndarray, detections: list):
-        """在帧上绘制已识别的芯片型号标签"""
-        if not self._ocr_cache:
-            return
-        target_classes = {c.upper() for c in OCR_TARGET_CLASSES}
-        for det in detections:
-            if det.class_name.upper() not in target_classes:
-                continue
-            cx = (det.bbox[0] + det.bbox[2]) // 2
-            cy = (det.bbox[1] + det.bbox[3]) // 2
-            cache_key = f"{cx//50}_{cy//50}"
-            model_name = self._ocr_cache.get(cache_key)
-            if model_name:
-                # 在检测框下方显示芯片型号 (青色标签)
-                x1, y2 = det.bbox[0], det.bbox[3]
-                label = f"[{model_name}]"
-                (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
-                cv2.rectangle(frame, (x1, y2 + 2), (x1 + tw + 4, y2 + th + 8),
-                              (128, 64, 0), -1)
-                cv2.putText(frame, label, (x1 + 2, y2 + th + 5),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
-
-    def _draw_ghost_wires(self, frame: np.ndarray):
-        """绘制缺失连接的幽灵线引导"""
-        if not self.ar_missing_links:
-            return
-        for pin1_loc, pin2_loc in self.ar_missing_links:
-            try:
-                p1 = board_calibrator.logic_to_frame_pixel(pin1_loc[0], pin1_loc[1])
-                p2 = board_calibrator.logic_to_frame_pixel(pin2_loc[0], pin2_loc[1])
-                if p1 and p2:
-                    cv2.arrowedLine(frame, p1, p2, (0, 255, 255), 3, tipLength=0.2)
-                    mid = ((p1[0] + p2[0]) // 2, (p1[1] + p2[1]) // 2)
-                    cv2.putText(frame, "MISSING", mid,
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
-            except Exception:
-                pass
-
-    # ================================================================
-    # 用户操作回调
+    # 用户操作回调 (校准 / 图片加载)
     # ================================================================
 
     def _start_calibration(self):
-        """校准 (TODO: 迁移到 PySide6 对话框)"""
+        """校准 — 委托给 CalibrationHelper"""
         self._dashboard.add_log("启动校准...")
-        self._log_all("校准: 请在弹出窗口中点击面包板4个角点")
-
-        # 暂时仍用 OpenCV 窗口 (后续迁移到 QDialog)
-        import threading
-        threading.Thread(target=self._calibration_flow, daemon=True).start()
-
-    def _calibration_flow(self):
-        """校准交互 (在 OpenCV 窗口完成)"""
-        if self._video_worker._source_mode == "image" and self._video_worker.static_frame is not None:
-            frame = self._video_worker.static_frame.copy()
-        else:
-            cap = cv2.VideoCapture(cam_cfg.device_id)
-            ret, frame = cap.read()
-            cap.release()
-            if not ret:
-                self._log_all("❌ 无法获取帧用于校准")
-                return
-
-        points = []
-        win_name = "Calibrate: Click 4 corners (TL->TR->BR->BL)"
-
-        h, w = frame.shape[:2]
-        max_w, max_h = 1000, 700
-        scale = min(max_w / w, max_h / h, 1.0)
-        disp = cv2.resize(frame, (int(w * scale), int(h * scale)))
-
-        def on_click(event, x, y, flags, param):
-            if event == cv2.EVENT_LBUTTONDOWN:
-                real_x, real_y = int(x / scale), int(y / scale)
-                points.append([real_x, real_y])
-
-        cv2.namedWindow(win_name)
-        cv2.setMouseCallback(win_name, on_click)
-
-        while len(points) < 4:
-            draw = disp.copy()
-            for i, p in enumerate(points):
-                sx, sy = int(p[0] * scale), int(p[1] * scale)
-                cv2.circle(draw, (sx, sy), 5, (0, 0, 255), -1)
-                cv2.putText(draw, str(i + 1), (sx + 10, sy),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
-            cv2.imshow(win_name, draw)
-            if cv2.waitKey(50) == ord('q'):
-                cv2.destroyWindow(win_name)
-                return
-
-        cv2.destroyWindow(win_name)
-
-        src_pts = np.float32(points)
-        board_calibrator.calibrate(src_pts)
-
-        warped = board_calibrator.warp(frame)
-        hole_count = board_calibrator.detect_holes(warped)
-        msg = f"✅ 校准完成，检测到 {hole_count} 个孔洞"
-        self._log_all(msg)
-        self._dashboard.update_module_status("calibr", True, f"{hole_count} 孔洞")
+        self._calibration.start_calibration(self._video_worker)
 
     def _load_image(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -725,33 +569,37 @@ class MainWindow(QMainWindow):
                 name = Path(path).name
                 self._log_all(f"已加载: {name}")
                 self._dashboard.add_log(f"加载测试图片: {name}")
+                # 自动检测面包板并校准
+                frame = self._video_worker.static_frame
+                if frame is not None:
+                    self._calibration.auto_detect_board(frame)
+
+    # ================================================================
+    # 电路操作 (主线程, 需要 read_lock)
+    # ================================================================
 
     def _show_netlist(self):
-        netlist = self.analyzer.get_circuit_description()
+        """显示网表 (主线程, read_lock 保护)"""
+        with self.ctx.read_lock():
+            netlist = self.ctx.analyzer.get_circuit_description()
         self._circuit_page.set_result(netlist)
         self._log_all("已生成网表")
 
-    def _draw_schematic(self):
-        try:
-            gen = SchematicGenerator(self.analyzer)
-            gen.generate_schematic(show=True)
-            self._log_all("✅ 原理图绘制完成")
-        except Exception as e:
-            self._log_all(f"原理图错误: {e}")
-
     def _reset_analyzer(self):
-        self.analyzer.reset()
-        self.stabilizer.clear()
-        self._log_all("🔄 分析器已重置")
+        """重置分析器 (主线程, 通过 AppContext 线程安全方法)"""
+        self.ctx.reset_analysis()
+        self._log_all("分析器已重置")
 
     def _set_golden_ref(self):
-        if self.analyzer.components:
-            validator.set_reference(self.analyzer)
-            count = len(self.analyzer.components)
-            self._log_all(f"⭐ 已设为金标准 ({count} 个元件)")
-            self._circuit_page.set_template_info(f"当前金标准: {count} 个元件")
-        else:
-            self._log_all("⚠️ 未检测到元件，无法设为金标准")
+        """设置金标准 (主线程, read_lock 保护)"""
+        with self.ctx.read_lock():
+            if self.ctx.analyzer.components:
+                self.ctx.validator.set_reference(self.ctx.analyzer)
+                count = len(self.ctx.analyzer.components)
+                self._log_all(f"已设为金标准 ({count} 个元件)")
+                self._circuit_page.set_template_info(f"当前金标准: {count} 个元件")
+            else:
+                self._log_all("未检测到元件, 无法设为金标准")
 
     def _save_template(self):
         path, _ = QFileDialog.getSaveFileName(
@@ -759,8 +607,8 @@ class MainWindow(QMainWindow):
             "LabGuardian 模板 (*.json)"
         )
         if path:
-            validator.save_reference(path)
-            self._log_all(f"💾 模板已保存: {Path(path).name}")
+            self.ctx.validator.save_reference(path)
+            self._log_all(f"模板已保存: {Path(path).name}")
 
     def _load_template(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -768,46 +616,49 @@ class MainWindow(QMainWindow):
             "LabGuardian 模板 (*.json)"
         )
         if path:
-            validator.load_reference(path)
+            self.ctx.validator.load_reference(path)
             name = Path(path).name
-            self._log_all(f"📂 模板已加载: {name}")
+            self._log_all(f"模板已加载: {name}")
             self._circuit_page.set_template_info(f"已加载: {name}")
 
     def _validate_circuit(self):
+        """验证电路 (主线程, read_lock 保护)"""
         self._circuit_page.clear_result()
         self._log_all("正在验证电路...")
 
-        results = validator.compare(self.analyzer)
+        with self.ctx.read_lock():
+            results = self.ctx.validator.compare(self.ctx.analyzer)
 
         output = "--- 验证报告 ---\n"
 
-        # v3: 显示相似度和进度
+        # 显示相似度和进度
         similarity = results.get('similarity', 0)
         progress = results.get('progress', 0)
         if similarity > 0:
-            output += f"📏 电路相似度: {similarity:.0%}\n"
+            output += f"电路相似度: {similarity:.0%}\n"
         if 0 < progress < 1.0:
-            output += f"📊 搭建进度: {progress:.0%}\n"
+            output += f"搭建进度: {progress:.0%}\n"
 
         for msg in results.get('errors', []):
             output += f"{msg}\n"
             self._circuit_page.append_result(msg)
 
-        # v3: 显示极性错误
+        # 显示极性错误
         for pol_err in results.get('polarity_errors', []):
             output += f"{pol_err}\n"
 
-        self.ar_missing_links = results.get('missing_links', [])
-        if self.ar_missing_links:
-            output += f"\n⚠️ 缺失连接: {len(self.ar_missing_links)} 处 (已在视频中标注)"
+        missing_links = results.get('missing_links', [])
+        self.ctx.set_missing_links(missing_links)
+        if missing_links:
+            output += f"\n缺失连接: {len(missing_links)} 处 (已在视频中标注)"
 
-        # v3: 显示缺失/多余元件摘要
+        # 显示缺失/多余元件摘要
         missing_c = results.get('missing_components', [])
         extra_c = results.get('extra_components', [])
         if missing_c:
-            output += f"\n📋 待搭建元件: {', '.join(missing_c)}"
+            output += f"\n待搭建元件: {', '.join(missing_c)}"
         if extra_c:
-            output += f"\n📋 多余元件: {', '.join(extra_c)}"
+            output += f"\n多余元件: {', '.join(extra_c)}"
 
         self._circuit_page.set_result(output)
         self._log_all(f"验证完成: {len(results.get('errors', []))} 个问题")
@@ -818,7 +669,11 @@ class MainWindow(QMainWindow):
 
     @Slot(str)
     def _ask_ai(self, question: str):
-        """处理 AI 问答请求"""
+        """处理 AI 问答请求 (主线程)
+
+        使用 ctx.get_circuit_snapshot() 获取电路描述, 无需加锁,
+        因为快照是在 _process_frame 的写锁内更新的字符串副本。
+        """
         if not question:
             return
 
@@ -826,9 +681,10 @@ class MainWindow(QMainWindow):
         self._chat_panel.set_ai_status(f"{Icons.LOADING} 思考中...", WARNING)
         self._chat_side.set_ai_status(f"{Icons.LOADING} 思考中...", WARNING)
 
-        context = self.analyzer.get_circuit_description()
+        # 使用快照而非直接读 analyzer (避免跨线程竞争)
+        context = self.ctx.get_circuit_snapshot()
 
-        self._llm_worker = LLMWorker(self.llm, question, context)
+        self._llm_worker = LLMWorker(self.ctx.llm, question, context)
         self._llm_worker.response_ready.connect(self._on_ai_response)
         self._llm_worker.error.connect(self._on_ai_error)
         self._llm_worker.start()
@@ -865,4 +721,6 @@ class MainWindow(QMainWindow):
         """窗口关闭时清理资源"""
         if hasattr(self, '_video_worker'):
             self._video_worker.stop()
+        if hasattr(self, '_heartbeat_worker'):
+            self._heartbeat_worker.stop()
         event.accept()

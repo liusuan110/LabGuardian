@@ -1,6 +1,6 @@
 """
 电路验证页面
-功能: 设置金标准 / 保存加载模板 / 运行验证 / 显示网表 / 绘制原理图
+功能: 设置金标准 / 保存加载模板 / 运行验证 / 显示网表
 """
 
 from PySide6.QtWidgets import (
@@ -25,7 +25,6 @@ class CircuitPage(QFrame):
         load_template_requested: 加载模板
         validate_requested:      运行验证
         show_netlist_requested:  显示网表
-        draw_schematic_requested:绘制原理图
         reset_requested:         重置分析器
     """
 
@@ -34,7 +33,6 @@ class CircuitPage(QFrame):
     load_template_requested  = Signal()
     validate_requested       = Signal()
     show_netlist_requested   = Signal()
-    draw_schematic_requested = Signal()
     reset_requested          = Signal()
 
     def __init__(self, parent=None):
@@ -63,8 +61,7 @@ class CircuitPage(QFrame):
             (f"{Icons.SAVE} 保存模板",       self.save_template_requested,  1, 0, None),
             (f"{Icons.LOAD_IMG} 加载模板",   self.load_template_requested,  1, 1, None),
             (f"{Icons.NETLIST} 网表",        self.show_netlist_requested,   2, 0, None),
-            (f"{Icons.SCHEMATIC} 原理图",    self.draw_schematic_requested, 2, 1, None),
-            (f"{Icons.RESET} 重置分析器",    self.reset_requested,          3, 0, "danger"),
+            (f"{Icons.RESET} 重置分析器",    self.reset_requested,          2, 1, "danger"),
         ]
         for text, signal, row, col, style_id in buttons:
             btn = QPushButton(text)

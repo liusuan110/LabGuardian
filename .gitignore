@@ -1,40 +1,33 @@
-# Python
+# ===== Python =====
 __pycache__/
 *.py[cod]
 *.pyo
 *.pyd
-*.log
+*.egg-info/
 .venv/
 venv/
+*.log
 
-# OS / IDE
+# ===== OS / IDE =====
 .DS_Store
 Thumbs.db
+nul
 .vscode/
 .idea/
+*.swp
+*.swo
 
-# Training outputs / caches
+# ===== Training outputs / caches =====
 runs/
 **/runs/
 *.cache
 
-# Datasets (usually huge; keep structure/configs, ignore images)
-dataset/images/
-dataset/train/images/
-dataset/val/images/
-dataset/test/images/
+# ===== Datasets (keep configs/READMEs, ignore images & labels) =====
+dataset/**/images/
+dataset/**/labels/
+dataset/Electronic-Components-1/
 
-# If you want to version labels, comment these out
-dataset/train/labels/
-dataset/val/labels/
-dataset/test/labels/
-
-# Embedded third-party datasets inside src/
-src/datasets/
-src/Electronic-Components-1/
-src/OneShot_Demo_Dataset/
-
-# Large model artifacts (prefer Git LFS or Releases)
+# ===== Large model artifacts (use Git LFS or Releases) =====
 *.pt
 *.onnx
 *.engine
@@ -42,15 +35,32 @@ src/OneShot_Demo_Dataset/
 *.pth
 *.ckpt
 
-# OpenVINO / GPU cache & large binaries
+# ===== OpenVINO / GPU cache & large binaries =====
 *.cl_cache
 *.blob
-src/openvino_tinyllama_model/model_cache/
-*.xml
 *.bin
+*.xml
+models/tinyllama_openvino/model_cache/
+models/yolov8n_openvino/
 
-# RAG / ChromaDB 持久化数据 (自动生成)
+# Keep small config files (manually add back if needed)
+!models/yolov8n_openvino/metadata.yaml
+!models/tinyllama_openvino/*.json
+!models/tinyllama_openvino/*.jinja
+
+# ===== RAG / ChromaDB (auto-generated) =====
 knowledge_base/chroma_db/
 
-# Embedding 模型本地缓存
+# ===== Embedding model local cache =====
 models/text2vec_chinese/
+
+# ===== Claude Code temp files =====
+tmpclaude-*
+
+# ===== Teacher frontend build artifacts =====
+teacher/frontend/node_modules/
+teacher/frontend/dist/
+teacher/frontend/.vite/
+
+# ===== Logs =====
+logs/
