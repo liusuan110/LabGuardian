@@ -23,12 +23,12 @@ runs/
 *.cache
 
 # ===== Datasets (keep configs/READMEs, ignore images & labels) =====
-dataset/**/images/
-dataset/**/labels/
-dataset/Electronic-Components-1/
+# dataset/**/images/
+# dataset/**/labels/
+# dataset/Electronic-Components-1/
 
 # ===== Large model artifacts (use Git LFS or Releases) =====
-*.pt
+# *.pt
 *.onnx
 *.engine
 *.tflite
