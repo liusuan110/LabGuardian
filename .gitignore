@@ -1,0 +1,66 @@
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+.venv/
+venv/
+*.log
+
+# ===== OS / IDE =====
+.DS_Store
+Thumbs.db
+nul
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ===== Training outputs / caches =====
+runs/
+**/runs/
+*.cache
+
+# ===== Datasets (keep configs/READMEs, ignore images & labels) =====
+dataset/**/images/
+dataset/**/labels/
+dataset/Electronic-Components-1/
+
+# ===== Large model artifacts (use Git LFS or Releases) =====
+*.pt
+*.onnx
+*.engine
+*.tflite
+*.pth
+*.ckpt
+
+# ===== OpenVINO / GPU cache & large binaries =====
+*.cl_cache
+*.blob
+*.bin
+*.xml
+models/tinyllama_openvino/model_cache/
+models/yolov8n_openvino/
+
+# Keep small config files (manually add back if needed)
+!models/yolov8n_openvino/metadata.yaml
+!models/tinyllama_openvino/*.json
+!models/tinyllama_openvino/*.jinja
+
+# ===== RAG / ChromaDB (auto-generated) =====
+knowledge_base/chroma_db/
+
+# ===== Embedding model local cache =====
+models/text2vec_chinese/
+
+# ===== Claude Code temp files =====
+tmpclaude-*
+
+# ===== Teacher frontend build artifacts =====
+teacher/frontend/node_modules/
+teacher/frontend/dist/
+teacher/frontend/.vite/
+
+# ===== Logs =====
+logs/
