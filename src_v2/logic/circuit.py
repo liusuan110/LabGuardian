@@ -57,6 +57,10 @@ def norm_component_type(t: str) -> str:
         return "PNP"
     if "TRANSISTOR" in u or "BJT" in u:
         return "TRANSISTOR"
+    if "POTENTIOMETER" in u or "POT" in u or "变阻" in u:
+        return "POTENTIOMETER"
+    if "IC_DIP" in u or ("IC" in u and "DIP" in u):
+        return "IC_DIP"
     if "BATTERY" in u or "POWER" in u:
         return "POWER"
     if "OPAMP" in u or "OP-AMP" in u or "OP_AMP" in u:
@@ -90,6 +94,17 @@ class PinRole(Enum):
     GND = "gnd"              # 电源负极
     POSITIVE = "positive"    # 正极 (电容)
     NEGATIVE = "negative"    # 负极
+    # 变阻器 (电位器)
+    WIPER = "wiper"              # 滑动触点 (中间引脚)
+    TERMINAL_A = "terminal_a"    # 端子A
+    TERMINAL_B = "terminal_b"    # 端子B
+    # IC 通用
+    IC_PIN = "ic_pin"                # 通用 IC 引脚
+    IC_VCC = "ic_vcc"                # IC 电源正
+    IC_GND = "ic_gnd"                # IC 接地
+    IC_OUTPUT = "ic_output"          # IC 输出
+    IC_INPUT_INV = "ic_input_inv"    # IC 反相输入
+    IC_INPUT_NON = "ic_input_non"    # IC 同相输入
 
 
 @dataclass
@@ -120,6 +135,10 @@ class CircuitComponent:
     # 三极管第三引脚
     pin3_loc: Optional[Tuple[str, str]] = None
 
+    # IC 多引脚 (DIP 封装)
+    pin_locs: List[Tuple[str, str]] = field(default_factory=list)
+    ic_model: str = ""  # OCR 识别的型号 (e.g. "LM324")
+
     def __repr__(self):
         pol = f" [{self.polarity.value}]" if self.polarity != Polarity.NONE else ""
         return f"{self.name}({self.pin1_loc}-{self.pin2_loc}{pol})"
@@ -140,10 +159,11 @@ class CircuitComponent:
 # ============================================================
 
 POLARIZED_TYPES = {"DIODE", "LED"}                  # 有极性的二端元件
-THREE_PIN_TYPES = {"TRANSISTOR", "NPN", "PNP"}       # 三端元件
+THREE_PIN_TYPES = {"TRANSISTOR", "NPN", "PNP", "POTENTIOMETER"}  # 三端元件
 CAPACITOR_TYPES = {"CAPACITOR"}                       # 可能有极性 (电解) 也可能无极性 (瓷片)
 NON_POLAR_TYPES = {"RESISTOR", "WIRE", "Push_Button"} # 无极性元件
-IC_TYPES = {"IC_555", "OPAMP"}                        # 多引脚 IC
+IC_TYPES = {"IC_DIP", "IC_555", "OPAMP"}              # 多引脚 IC
+POTENTIOMETER_TYPES = {"POTENTIOMETER"}                # 电位器/变阻器
 POWER_KEYWORDS = {"VCC", "GND", "POWER", "BATTERY"}  # 电源相关关键词
 
 
@@ -152,33 +172,39 @@ class CircuitAnalyzer:
 
     基于 NetworkX 图论，将面包板上检测到的元件建模为电气连接图。
     面包板规则: 同一行 a-e 导通 (Left节点), f-j 导通 (Right节点)。
-    电源轨: 最上/最下行为总线, 通过拓扑分析推断 VCC/GND。
+    电源轨: 4 条独立总线 (顶部2条 + 底部2条), 由学生标注用途。
     """
 
-    def __init__(self,
-                 rail_top_rows: Tuple[int, ...] = (),
-                 rail_bottom_rows: Tuple[int, ...] = ()):
+    def __init__(self, rail_track_rows: Optional[Dict[str, tuple]] = None):
         """
         Args:
-            rail_top_rows:    面包板顶部电源轨行号 (e.g. (1, 2))
-            rail_bottom_rows: 面包板底部电源轨行号 (e.g. (29, 30))
+            rail_track_rows: 电源轨轨道定义, 格式: {"RAIL_TOP_1": (1,), ...}
+                             key 为轨道标识, value 为该轨道对应的行号元组
         """
         self.graph = nx.Graph()
         self.components: List[CircuitComponent] = []
         self.power_nets: Dict[str, str] = {}  # node_name → "VCC" | "GND"
         self._name_counters: Dict[str, int] = {}  # 元件类型 → 自增计数
 
-        # 电源轨行号 (总线节点: 同一轨所有行共用一个节点)
-        self._rail_top_rows = set(rail_top_rows)
-        self._rail_bottom_rows = set(rail_bottom_rows)
-        self._all_rail_rows = self._rail_top_rows | self._rail_bottom_rows
+        # 电源轨模型: 4 条独立轨道, 每条是一个总线节点
+        self._rail_track_rows = rail_track_rows or {}
+        # 反向映射: 行号 → 轨道标识
+        self._row_to_rail: Dict[int, str] = {}
+        for track_id, rows in self._rail_track_rows.items():
+            for r in rows:
+                self._row_to_rail[r] = track_id
+
+        # 学生标注的轨道用途: 轨道标识 → 用途描述
+        # e.g. {"RAIL_TOP_1": "VCC +5V", "RAIL_TOP_2": "GND", ...}
+        self.rail_assignments: Dict[str, str] = {}
 
     def reset(self):
-        """清空所有元件和连接"""
+        """清空所有元件和连接 (保留轨道配置和学生标注)"""
         self.graph.clear()
         self.components = []
         self.power_nets = {}
         self._name_counters = {}
+        # 注: rail_assignments 和 _rail_track_rows 不清空, 它们是持久配置
 
     # ---- 元件命名 ----
     _TYPE_PREFIX = {
@@ -186,6 +212,7 @@ class CircuitAnalyzer:
         "CAPACITOR": "C", "WIRE": "W", "Push_Button": "SW",
         "TRANSISTOR": "Q", "NPN": "Q", "PNP": "Q",
         "IC_555": "U", "OPAMP": "U", "POWER": "PWR",
+        "POTENTIOMETER": "VR", "IC_DIP": "U",
     }
 
     def _auto_name(self, comp_type: str) -> str:
@@ -208,6 +235,22 @@ class CircuitAnalyzer:
         self.components.append(comp)
 
         node1 = self._get_node_name(comp.pin1_loc)
+
+        # N-pin IC 元件: 创建中心 hub 节点, 每个引脚连接到面包板导通节点
+        if comp.pin_locs and len(comp.pin_locs) > 3:
+            hub_node = f"IC_{comp.name}"
+            self.graph.add_node(hub_node, component=comp.name, kind="ic_hub")
+
+            for i, pin_loc in enumerate(comp.pin_locs):
+                pin_node = self._get_node_name(pin_loc)
+                role = comp.pin_roles[i].value if i < len(comp.pin_roles) else 'ic_pin'
+                self.graph.add_edge(hub_node, pin_node,
+                                    component=comp.name,
+                                    type=comp.type,
+                                    pin_number=i + 1,
+                                    pin_role=role,
+                                    confidence=comp.confidence)
+            return  # 跳过 2-pin/3-pin 路径
 
         if comp.pin3_loc is not None:
             # 三端元件 (三极管): pin1=E, pin3=B(中间), pin2=C
@@ -258,10 +301,10 @@ class CircuitAnalyzer:
 
         面包板导通规则:
           主区域: a-e → Row{n}_L (左侧5孔导通), f-j → Row{n}_R (右侧5孔导通)
-          电源轨: 顶部行 → RAIL_TOP (总线), 底部行 → RAIL_BOTTOM (总线)
+          电源轨: 4 条独立总线, 行号匹配时映射为轨道节点 (如 RAIL_TOP_1)
                   '+'/'-' → PWR_PLUS / PWR_MINUS (旧格式兼容)
 
-        电源轨总线: 同一轨的所有行(如 row 1,2)是横向全部导通的,
+        电源轨总线: 同一轨道的所有行是横向全部导通的,
         不区分左右侧, 映射为同一个总线节点。
         """
         row, col = loc
@@ -270,16 +313,14 @@ class CircuitAnalyzer:
         if col in ('-', 'minus', 'N', 'GND'):
             return "PWR_MINUS"
 
-        # 电源轨行: 整行导通, 映射为总线节点
+        # 电源轨行: 检查是否属于某条轨道
         try:
             row_int = int(row)
         except (ValueError, TypeError):
             row_int = -1
 
-        if row_int in self._rail_top_rows:
-            return "RAIL_TOP"
-        if row_int in self._rail_bottom_rows:
-            return "RAIL_BOTTOM"
+        if row_int in self._row_to_rail:
+            return self._row_to_rail[row_int]
 
         # 普通行: 左右分侧导通
         if col in ('a', 'b', 'c', 'd', 'e'):
@@ -336,6 +377,30 @@ class CircuitAnalyzer:
             ctype = self._norm_type(comp.type)
             if ctype == "WIRE":
                 continue
+
+            cid = f"C{comp_idx}"
+            comp_idx += 1
+
+            node_attrs = {
+                "kind": "comp",
+                "ctype": ctype,
+                "polarity": comp.polarity.value,
+            }
+
+            # IC 多引脚元件
+            if comp.pin_locs and len(comp.pin_locs) > 3:
+                node_attrs["pins"] = len(comp.pin_locs)
+                topo.add_node(cid, **node_attrs)
+                for i, pin_loc in enumerate(comp.pin_locs):
+                    try:
+                        pin_node_name = self._get_node_name(pin_loc)
+                        n = node_to_net.get(pin_node_name)
+                        if n:
+                            pin_role = comp.pin_roles[i].value if i < len(comp.pin_roles) else 'ic_pin'
+                            topo.add_edge(cid, n, pin_role=pin_role, pin_number=i + 1)
+                    except Exception:
+                        pass
+                continue  # 跳过 2-pin/3-pin 路径
 
             try:
                 n1 = node_to_net.get(self._get_node_name(comp.pin1_loc))
@@ -434,7 +499,16 @@ class CircuitAnalyzer:
             elif comp.polarity == Polarity.UNKNOWN:
                 role_info = " [极性未知]"
 
-            if comp.pin3_loc:
+            if comp.pin_locs and len(comp.pin_locs) > 3:
+                # IC 多引脚元件
+                ic_model_str = f" [{comp.ic_model}]" if comp.ic_model else ""
+                desc += f"  {comp.name} ({ctype}{ic_model_str}):\n"
+                for i, pin_loc in enumerate(comp.pin_locs):
+                    node = self._get_node_name(pin_loc)
+                    net = node_to_net.get(node, "?")
+                    role = comp.pin_roles[i].value if i < len(comp.pin_roles) else f"pin{i+1}"
+                    desc += f"    Pin{i+1}({role})=Row{pin_loc[0]}{pin_loc[1]}({net})\n"
+            elif comp.pin3_loc:
                 # 三端元件 (三极管)
                 node2 = self._get_node_name(comp.pin2_loc) if comp.pin2_loc else "?"
                 node3 = self._get_node_name(comp.pin3_loc)
@@ -475,6 +549,8 @@ class CircuitAnalyzer:
                     comp_nodes.add(self._get_node_name(comp.pin2_loc))
                 if comp.pin3_loc:
                     comp_nodes.add(self._get_node_name(comp.pin3_loc))
+                for pl in comp.pin_locs:
+                    comp_nodes.add(self._get_node_name(pl))
                 if comp_nodes & group:
                     comps_on_net.append(comp.name)
 
@@ -492,7 +568,18 @@ class CircuitAnalyzer:
         if self.power_nets:
             desc += "\n电源:\n"
             for node, ptype in sorted(self.power_nets.items()):
-                desc += f"  {node} → {ptype}\n"
+                label = self.rail_assignments.get(node, "")
+                extra = f" ({label})" if label else ""
+                desc += f"  {node} → {ptype}{extra}\n"
+
+        # ---- 4b. 电源轨状态 ----
+        active_rails = self.get_active_rail_tracks()
+        unassigned = self.get_unassigned_active_rails()
+        if active_rails:
+            desc += "\n电源轨:\n"
+            desc += self.get_rail_summary() + "\n"
+        if unassigned:
+            desc += f"\n⚠ 有 {len(unassigned)} 条轨道有连接但未标注用途: {', '.join(unassigned)}\n"
 
         # ---- 5. 潜在问题 ----
         issues = self._quick_check_issues()
@@ -545,23 +632,20 @@ class CircuitAnalyzer:
     # ========================================================
 
     def _identify_power_nets(self):
-        """启发式识别电源网络：
+        """基于学生标注识别电源网络。
 
-        1. 电源轨总线节点 (RAIL_TOP / RAIL_BOTTOM) 通过拓扑推断 VCC/GND
-        2. 旧格式电源轨 (PWR_PLUS / PWR_MINUS) 直接标记
-        3. 标记为 POWER/BATTERY 的元件引脚
-        4. 引脚角色为 VCC/GND 的元件引脚
+        电源轨标注由学生在 UI 中主动设置, 不再通过拓扑推断。
+        识别来源:
+          1. 学生标注的轨道 (rail_assignments) — 主要来源
+          2. 旧格式电源轨 (PWR_PLUS / PWR_MINUS) — 兼容
+          3. 元件引脚角色标记 (PinRole.VCC / GND) — 补充
         """
-        # 1. 电源轨总线: 通过拓扑推断 VCC vs GND
-        has_top = "RAIL_TOP" in self.graph
-        has_bottom = "RAIL_BOTTOM" in self.graph
-
-        if has_top or has_bottom:
-            top_role, bottom_role = self._infer_power_rail_polarity()
-            if has_top:
-                self.power_nets["RAIL_TOP"] = top_role
-            if has_bottom:
-                self.power_nets["RAIL_BOTTOM"] = bottom_role
+        # 1. 学生标注的电源轨
+        for track_id, label in self.rail_assignments.items():
+            if track_id in self.graph:
+                power_type = self._parse_rail_label(label)
+                if power_type:
+                    self.power_nets[track_id] = power_type
 
         # 2. 旧格式电源轨直接标记
         if "PWR_PLUS" in self.graph:
@@ -582,85 +666,97 @@ class CircuitAnalyzer:
                         self.power_nets[node] = "GND"
             # 其他元件如果引脚被标记为 VCC/GND, 也记录
             for i, role in enumerate(comp.pin_roles):
-                if role == PinRole.VCC:
-                    loc = [comp.pin1_loc, comp.pin2_loc, comp.pin3_loc][i] if i < 3 else None
+                if role in (PinRole.VCC, PinRole.IC_VCC):
+                    if comp.pin_locs and i < len(comp.pin_locs):
+                        loc = comp.pin_locs[i]
+                    elif i < 3:
+                        loc = [comp.pin1_loc, comp.pin2_loc, comp.pin3_loc][i]
+                    else:
+                        loc = None
                     if loc:
                         self.power_nets[self._get_node_name(loc)] = "VCC"
-                elif role == PinRole.GND:
-                    loc = [comp.pin1_loc, comp.pin2_loc, comp.pin3_loc][i] if i < 3 else None
+                elif role in (PinRole.GND, PinRole.IC_GND):
+                    if comp.pin_locs and i < len(comp.pin_locs):
+                        loc = comp.pin_locs[i]
+                    elif i < 3:
+                        loc = [comp.pin1_loc, comp.pin2_loc, comp.pin3_loc][i]
+                    else:
+                        loc = None
                     if loc:
                         self.power_nets[self._get_node_name(loc)] = "GND"
 
-    def _infer_power_rail_polarity(self) -> Tuple[str, str]:
-        """从电路拓扑推断顶部轨和底部轨分别是 VCC 还是 GND。
+    @staticmethod
+    def _parse_rail_label(label: str) -> Optional[str]:
+        """将学生输入的轨道标签解析为标准电源类型。
 
-        推断策略 (投票机制):
-          1. LED/二极管阴极侧连接的轨 → GND 票
-          2. LED/二极管阳极链方向连接的轨 → VCC 票
-          3. 三极管发射极连接的轨 → 通常是 GND (NPN 共射电路)
-          4. 三极管集电极经电阻到轨 → VCC 票
-          5. 默认: 顶部=VCC, 底部=GND (面包板约定:上红下蓝)
-
-        Returns:
-            (top_role, bottom_role): 各为 "VCC" 或 "GND"
+        支持的输入格式:
+          "VCC", "VCC +5V", "+5V", "正电源 5V" → "VCC"
+          "GND", "地", "0V", "负极" → "GND"
+          "VCC +3.3V" → "VCC"
+          其他未识别 → None
         """
-        # 投票: positive → top=VCC, negative → top=GND
-        vote = 0
+        if not label:
+            return None
+        u = label.strip().upper()
+        # VCC 类
+        if any(kw in u for kw in ("VCC", "VDD", "V+", "+5", "+3.3", "+12",
+                                   "正电源", "正极", "电源正")):
+            return "VCC"
+        if u.startswith("+") and any(c.isdigit() for c in u):
+            return "VCC"
+        # GND 类
+        if any(kw in u for kw in ("GND", "VSS", "V-", "0V",
+                                   "地", "负极", "电源负", "接地")):
+            return "GND"
+        # 宽松匹配: 包含数字+V 且无 GND 关键词 → 视为 VCC
+        if "V" in u and any(c.isdigit() for c in u):
+            return "VCC"
+        return None
 
-        for comp in self.components:
-            ctype = self._norm_type(comp.type)
+    # ========================================================
+    # 电源轨管理 (学生交互)
+    # ========================================================
 
-            if ctype in POLARIZED_TYPES and comp.pin1_loc and comp.pin2_loc:
-                # LED / 二极管: pin1=阳极, pin2=阴极
-                node_anode = self._get_node_name(comp.pin1_loc)
-                node_cathode = self._get_node_name(comp.pin2_loc)
+    def set_rail_assignment(self, track_id: str, label: str):
+        """学生标注某条轨道的用途。
 
-                # 阴极连到哪个轨 → 那个轨是 GND
-                if node_cathode == "RAIL_TOP":
-                    vote -= 2  # top=GND
-                elif node_cathode == "RAIL_BOTTOM":
-                    vote += 2  # bottom=GND → top=VCC
+        Args:
+            track_id: 轨道标识, 如 "RAIL_TOP_1"
+            label: 用途描述, 如 "VCC +5V", "GND"
+        """
+        if track_id in self._rail_track_rows or track_id.startswith("RAIL_"):
+            self.rail_assignments[track_id] = label
+            logger.info(f"[Rail] 轨道 {track_id} 已标注为: {label}")
 
-                # 阳极连到哪个轨 → 那个轨是 VCC
-                if node_anode == "RAIL_TOP":
-                    vote += 2  # top=VCC
-                elif node_anode == "RAIL_BOTTOM":
-                    vote -= 2  # bottom=VCC → top=GND
+    def clear_rail_assignments(self):
+        """清除所有轨道标注"""
+        self.rail_assignments.clear()
+        logger.info("[Rail] 所有轨道标注已清除")
 
-                # 间接连接: 阴极经导线到轨
-                if node_cathode not in ("RAIL_TOP", "RAIL_BOTTOM"):
-                    for neighbor in self.graph.neighbors(node_cathode):
-                        edge = self.graph.edges[node_cathode, neighbor]
-                        if self._norm_type(edge.get("type", "")) == "WIRE":
-                            if neighbor == "RAIL_TOP":
-                                vote -= 1
-                            elif neighbor == "RAIL_BOTTOM":
-                                vote += 1
+    def get_active_rail_tracks(self) -> List[str]:
+        """返回当前有元件/导线连接的轨道标识列表。"""
+        active = []
+        for track_id in self._rail_track_rows:
+            if track_id in self.graph and self.graph.degree(track_id) > 0:
+                active.append(track_id)
+        return active
 
-            if ctype in THREE_PIN_TYPES:
-                # 三极管: 发射极通常接 GND (NPN 共射)
-                if comp.pin_roles and len(comp.pin_roles) >= 2:
-                    for i, role in enumerate(comp.pin_roles):
-                        loc = [comp.pin1_loc, comp.pin2_loc, comp.pin3_loc][i] if i < 3 else None
-                        if loc is None:
-                            continue
-                        node = self._get_node_name(loc)
-                        if role == PinRole.EMITTER:
-                            if node == "RAIL_TOP":
-                                vote -= 1  # E→TOP → TOP=GND
-                            elif node == "RAIL_BOTTOM":
-                                vote += 1  # E→BOTTOM → BOTTOM=GND → TOP=VCC
-                        elif role == PinRole.COLLECTOR:
-                            if node == "RAIL_TOP":
-                                vote += 1  # C→TOP → TOP=VCC
-                            elif node == "RAIL_BOTTOM":
-                                vote -= 1
+    def get_unassigned_active_rails(self) -> List[str]:
+        """返回已有连接但尚未被学生标注的轨道列表。"""
+        active = self.get_active_rail_tracks()
+        return [t for t in active if t not in self.rail_assignments]
 
-        # 默认: 顶部=VCC, 底部=GND (面包板约定上红下蓝)
-        if vote >= 0:
-            return ("VCC", "GND")
-        else:
-            return ("GND", "VCC")
+    def get_rail_summary(self) -> str:
+        """返回轨道状态摘要 (供 UI / LLM 使用)。"""
+        lines = []
+        for track_id in sorted(self._rail_track_rows.keys()):
+            rows = self._rail_track_rows[track_id]
+            label = self.rail_assignments.get(track_id, "未标注")
+            in_graph = track_id in self.graph
+            degree = self.graph.degree(track_id) if in_graph else 0
+            status = f"{degree}个连接" if in_graph else "无连接"
+            lines.append(f"  {track_id} (行{rows}): {label} [{status}]")
+        return "\n".join(lines)
 
     def get_net_count(self) -> int:
         """获取电气网络数量"""
@@ -727,6 +823,22 @@ class CircuitAnalyzer:
                 'confidence': comp.confidence,
                 'pins': [],
             }
+
+            # IC 多引脚元件: 导出所有引脚
+            if comp.pin_locs and len(comp.pin_locs) > 3:
+                if comp.ic_model:
+                    entry['ic_model'] = comp.ic_model
+                for i, pin_loc in enumerate(comp.pin_locs):
+                    pn = self._get_node_name(pin_loc)
+                    role = comp.pin_roles[i].value if i < len(comp.pin_roles) else 'ic_pin'
+                    entry['pins'].append({
+                        'loc': pin_loc,
+                        'role': role,
+                        'pin_number': i + 1,
+                        'net': node_to_net_id.get(pn, 'floating'),
+                    })
+                comp_list.append(entry)
+                continue
 
             # Pin 1
             n1 = self._get_node_name(comp.pin1_loc)

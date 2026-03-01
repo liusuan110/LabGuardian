@@ -25,13 +25,16 @@ from config import vision as vision_cfg, find_best_yolo_model, TWO_PIN_COMPONENT
 # 参考: 电阻色环体 ≈ 6mm, 引线外露 ≈ 2-4mm → 比例 0.08-0.12
 
 _PIN_EXTENSION = {
-    "RESISTOR":    0.10,  # 电阻: 引线细长, 略超出体边
-    "Resistor":    0.10,
-    "LED":         0.08,  # LED: 引脚从底座伸出, 顶视遮挡严重
-    "DIODE":       0.10,  # 二极管: 类似电阻
-    "CAPACITOR":   0.08,  # 电容: 引脚较短
-    "Wire":        0.02,  # 导线: 端点基本就是连接点
-    "Push_Button": 0.06,  # 按钮: 引脚在底部
+    "RESISTOR":       0.10,  # 电阻: 引线细长, 略超出体边
+    "Resistor":       0.10,
+    "LED":            0.08,  # LED: 引脚从底座伸出, 顶视遮挡严重
+    "DIODE":          0.10,  # 二极管: 类似电阻
+    "CAPACITOR":      0.08,  # 电容: 引脚较短
+    "Wire":           0.02,  # 导线: 端点基本就是连接点
+    "Push_Button":    0.06,  # 按钮: 引脚在底部
+    "TRANSISTOR":     0.10,  # 三极管: TO-92 引脚从封装体伸出
+    "IC_DIP":         0.02,  # IC: 引脚紧贴封装体边缘
+    "POTENTIOMETER":  0.08,  # 电位器: 引脚在底部
 }
 _DEFAULT_PIN_EXTENSION = 0.08
 
@@ -47,6 +50,7 @@ class Detection:
     pin2_pixel: Optional[Tuple[float, float]] = None  # 引脚2像素坐标
     is_obb: bool = False                      # 是否为旋转检测结果
     obb_corners: Optional[np.ndarray] = None  # OBB 四角坐标 (4,2)
+    wire_color: Optional[str] = None          # 导线颜色 (仅 Wire 类型, 由 WireAnalyzer 填充)
 
 
 class ComponentDetector:

@@ -98,7 +98,7 @@ class Sidebar(QFrame):
         # 页面按钮
         pages = [
             (Icons.HOME,     "主面板",    "home"),
-            (Icons.VIDEO,    "视频检测",  "video"),
+            (Icons.CAMERA,   "分析结果",  "results"),
             (Icons.CHAT,     "AI 助手",   "chat"),
             (Icons.CIRCUIT,  "电路验证",  "circuit"),
             (Icons.SETTINGS, "设置",      "settings"),

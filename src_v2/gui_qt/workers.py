@@ -3,10 +3,11 @@ QThread 工作线程
 职责: 将耗时操作从主线程解耦, 通过信号驱动 UI 更新
 
 线程:
-  - VideoWorker:      摄像头采集 → 帧处理 → 发送 QPixmap
-  - ModelLoader:      后台加载 YOLO / LLM 模型
-  - LLMWorker:        异步 LLM 问答
-  - HeartbeatWorker:  课堂模式心跳上报 + 教师指导接收
+  - VideoWorker:          摄像头采集 → 帧处理 → 发送 QPixmap (已弃用, 保留兼容)
+  - ImageAnalysisWorker:  图片分析 → 返回 AnalysisResult
+  - ModelLoader:          后台加载 YOLO / LLM 模型
+  - LLMWorker:            异步 LLM 问答
+  - HeartbeatWorker:      课堂模式心跳上报 + 教师指导接收
 """
 
 import cv2
@@ -225,6 +226,46 @@ class LLMWorker(QThread):
             self.response_ready.emit(answer)
         except Exception as e:
             self.error.emit(f"AI 回复错误: {e}")
+
+
+class ImageAnalysisWorker(QThread):
+    """
+    图片分析工作线程
+
+    在后台线程运行 ImageAnalyzer.analyze(), 通过信号驱动 UI 更新.
+
+    信号:
+        progress(str):      进度消息 (e.g. "校准中...", "检测中 (2/3)...")
+        finished(object):   AnalysisResult 对象
+        error(str):         错误信息
+    """
+    progress = Signal(str)
+    finished = Signal(object)   # AnalysisResult
+    error = Signal(str)
+
+    def __init__(self, analyzer, images: list, conf: float = 0.25,
+                 imgsz: int = 1280):
+        super().__init__()
+        self.analyzer = analyzer
+        self.images = images
+        self.conf = conf
+        self.imgsz = imgsz
+
+    def run(self):
+        try:
+            result = self.analyzer.analyze(
+                self.images,
+                conf=self.conf,
+                imgsz=self.imgsz,
+                progress_callback=self._emit_progress,
+            )
+            self.finished.emit(result)
+        except Exception as e:
+            logger.error(f"[ImageAnalysis] 分析异常: {traceback.format_exc()}")
+            self.error.emit(f"分析错误: {e}")
+
+    def _emit_progress(self, msg: str):
+        self.progress.emit(msg)
 
 
 class HeartbeatWorker(QThread):

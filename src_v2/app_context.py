@@ -19,10 +19,10 @@ LabGuardian AppContext -- 服务注册中心
                                               BreadboardCalibrator
 
 线程模型:
-  - VideoWorker 线程: 写 analyzer / stabilizer / ocr_cache  (write lock)
-  - 主线程 (UI):      读 analyzer (read lock),
-                       调用 validate / ask_ai / show_netlist
-  - LLMWorker 线程:   读 circuit_description 快照 (无需锁, 使用快照)
+  - ImageAnalysisWorker 线程: 写 analyzer (write lock)
+  - 主线程 (UI):              读 analyzer (read lock),
+                               调用 validate / ask_ai / show_netlist
+  - LLMWorker 线程:           读 circuit_description 快照 (无需锁, 使用快照)
 
 使用方式:
     ctx = AppContext()
@@ -118,8 +118,7 @@ class AppContext:
 
         # ---- 推理层 ----
         self.analyzer = CircuitAnalyzer(
-            rail_top_rows=circuit_cfg.vcc_rail_rows,
-            rail_bottom_rows=circuit_cfg.gnd_rail_rows,
+            rail_track_rows=circuit_cfg.rail_track_rows,
         )
         self.polarity = PolarityResolver()
         self.validator = CircuitValidator()
@@ -131,33 +130,23 @@ class AppContext:
         # ---- 线程安全: 读写锁 (保护 analyzer + stabilizer) ----
         self._rw_lock = ReadWriteLock()
 
-        # ---- OCR 缓存 (仅 video 线程访问, 但提供线程安全接口) ----
+        # ---- OCR 缓存 (线程安全接口) ----
         self._ocr_lock = threading.Lock()
         self._ocr_cache: Dict[str, str] = {}   # cache_key -> chip_model
 
-        # ---- 幽灵线数据 (主线程写, video 线程读) ----
+        # ---- 幽灵线数据 (主线程写, 分析线程读) ----
         self._ghost_lock = threading.Lock()
         self._ar_missing_links: list = []
-
-        # ---- OCR 帧计数 ----
-        self._ocr_frame_skip = 0
-        self._ocr_interval = 30
 
         # ---- RAG 已查询型号缓存 ----
         self._rag_queried_models: Set[str] = set()
 
-        # ---- 最新电路描述快照 (video 线程写, AI 线程读) ----
+        # ---- 最新电路描述快照 (分析线程写, AI 线程读) ----
         self._desc_lock = threading.Lock()
         self._circuit_description_snapshot: str = ""
 
-        # ---- ROI 裁剪缓存 (校准后设置, video 线程读) ----
+        # ---- ROI 裁剪缓存 (校准后设置) ----
         self._roi_rect: Optional[Tuple[int, int, int, int]] = None  # (x1,y1,x2,y2)
-
-        # ---- 帧差分跳帧 (video 线程内使用) ----
-        import numpy as _np
-        self._prev_gray: Optional[_np.ndarray] = None   # 上一帧灰度图
-        self._cached_stable_dets: List = []              # 缓存的稳定化检测结果
-        self._frames_since_detect: int = 0               # 连续跳过 YOLO 的帧数
 
     # ================================================================
     # 读写锁上下文管理器
@@ -271,6 +260,34 @@ class AppContext:
         return status
 
     # ================================================================
+    # 电源轨标注 (学生交互, 线程安全)
+    # ================================================================
+
+    def set_rail_assignment(self, track_id: str, label: str):
+        """学生标注某条轨道的用途 (线程安全)"""
+        with self.write_lock():
+            self.analyzer.set_rail_assignment(track_id, label)
+
+    def clear_rail_assignments(self):
+        """清除所有轨道标注 (线程安全)"""
+        with self.write_lock():
+            self.analyzer.clear_rail_assignments()
+
+    def get_rail_track_ids(self) -> list:
+        """返回所有轨道标识 (无需锁)"""
+        return list(self.analyzer._rail_track_rows.keys())
+
+    def get_rail_assignments(self) -> dict:
+        """返回当前轨道标注的副本 (线程安全)"""
+        with self.read_lock():
+            return dict(self.analyzer.rail_assignments)
+
+    def get_unassigned_active_rails(self) -> list:
+        """返回有连接但未标注的轨道 (线程安全)"""
+        with self.read_lock():
+            return self.analyzer.get_unassigned_active_rails()
+
+    # ================================================================
     # 清理
     # ================================================================
 
@@ -283,7 +300,3 @@ class AppContext:
         self.set_missing_links([])
         self._rag_queried_models.clear()
         self._circuit_description_snapshot = ""
-        # 重置帧差分缓存
-        self._prev_gray = None
-        self._cached_stable_dets = []
-        self._frames_since_detect = 0

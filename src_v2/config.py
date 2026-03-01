@@ -99,7 +99,7 @@ class VisionConfig:
 @dataclass
 class CalibrationConfig:
     """面包板参数"""
-    rows: int = 30                         # 面包板行数 (30=半尺寸, 63=全尺寸)
+    rows: int = 63                         # 面包板行数 (30=半尺寸, 63=全尺寸)
     cols_per_side: int = 5                 # 每侧列数 (a-e, f-j)
     output_size: tuple = (600, 800)        # 透视变换输出尺寸 (宽, 高)
 
@@ -285,7 +285,7 @@ class OCRConfig:
     min_confidence: float = 0.3            # OCR 最低置信度
     # 触发 OCR 的 YOLO 检测类别 (检测到这些类别时自动 OCR)
     target_classes: tuple = (
-        "IC", "CHIP", "DIP", "TRANSISTOR", "NPN", "PNP", "BJT",
+        "IC", "CHIP", "DIP", "IC_DIP", "TRANSISTOR", "NPN", "PNP", "BJT",
         "NE555", "LM358", "OPAMP", "REGULATOR",
     )
 
@@ -357,28 +357,37 @@ class ClassroomConfig:
 # 类别列表 (与训练 data.yaml 中的顺序一致)
 COMPONENT_CLASSES = [
     "CAPACITOR",
-    "DIODE", 
+    "DIODE",
     "LED",
     "RESISTOR",
     "Push_Button",
     "Wire",
+    "TRANSISTOR",       # TO-92 三极管
+    "IC_DIP",           # DIP 封装 IC (运放等)
+    "POTENTIOMETER",    # 电位器/变阻器
 ]
 
 # 类别颜色 (BGR)
 CLASS_COLORS = {
-    "CAPACITOR":   (0, 0, 255),
-    "DIODE":       (0, 255, 0),
-    "LED":         (255, 0, 0),
-    "RESISTOR":    (0, 255, 255),
-    "Push_Button": (255, 255, 0),
-    "Wire":        (255, 0, 255),
+    "CAPACITOR":      (0, 0, 255),      # Red
+    "DIODE":          (0, 255, 0),      # Green
+    "LED":            (255, 0, 0),      # Blue
+    "RESISTOR":       (0, 255, 255),    # Yellow
+    "Push_Button":    (255, 255, 0),    # Cyan
+    "Wire":           (255, 0, 255),    # Magenta
+    "TRANSISTOR":     (0, 128, 255),    # Orange
+    "IC_DIP":         (128, 0, 128),    # Purple
+    "POTENTIOMETER":  (0, 200, 200),    # Teal
 }
 
 # 两端元件 (需要提取两个引脚坐标)
 TWO_PIN_COMPONENTS = {"Wire", "RESISTOR", "DIODE", "Resistor", "LED", "CAPACITOR"}
 
 # 三端元件 (需要推断第三引脚)
-THREE_PIN_COMPONENTS = {"TRANSISTOR", "NPN", "PNP", "BJT"}
+THREE_PIN_COMPONENTS = {"TRANSISTOR", "NPN", "PNP", "BJT", "POTENTIOMETER"}
+
+# IC DIP 封装元件 (多引脚, 由 OCR + 引脚数据库映射)
+IC_DIP_COMPONENTS = {"IC_DIP", "IC", "CHIP", "DIP", "OPAMP"}
 
 
 # ============================================================
@@ -393,10 +402,16 @@ class CircuitConfig:
     enable_polarity: bool = True           # 是否启用极性推断
     polarity_conf_threshold: float = 0.4   # 极性推断所需的最低检测置信度
 
-    # --- 面包板电源轨 ---
-    power_rail_rows: tuple = (1, 2, 29, 30)   # 被视为电源轨的行号
-    vcc_rail_rows: tuple = (1, 2)              # VCC 轨行号 (红色)
-    gnd_rail_rows: tuple = (29, 30)            # GND 轨行号 (蓝色)
+    # --- 面包板电源轨 (4 轨道模型) ---
+    # 全尺寸面包板上下各 2 条轨道, 共 4 条独立总线
+    # key: 轨道标识, value: 该轨道对应的校准器行号
+    # 注: 具体行号取决于校准结果, 请根据实际面包板调整
+    rail_track_rows: dict = field(default_factory=lambda: {
+        "RAIL_TOP_1": (1,),       # 顶部外侧轨道
+        "RAIL_TOP_2": (2,),       # 顶部内侧轨道
+        "RAIL_BOTTOM_1": (64,),   # 底部内侧轨道
+        "RAIL_BOTTOM_2": (65,),   # 底部外侧轨道
+    })
 
     # --- 三极管 (TO-92) 引脚映射 ---
     # TO-92 封装: 从平面侧看, 左→右 = E/B/C

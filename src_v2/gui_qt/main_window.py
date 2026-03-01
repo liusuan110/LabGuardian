@@ -2,10 +2,10 @@
 LabGuardian 主窗口 (PySide6)
 PyDracula 风格: 侧边栏 + 多页面路由 + 自定义标题栏
 
-架构 (v4 — 模块拆分):
-  - 帧处理管线提取至 frame_pipeline.FramePipeline (纯计算, 无 Qt 依赖)
-  - 校准交互提取至 calibration.CalibrationHelper
-  - MainWindow 仅负责 UI 编排 / 信号连接 / 用户操作回调
+架构 (v5 — Image-only):
+  - ImageAnalyzer:        图片分析引擎 (YOLO + Wire + 电路拓扑)
+  - CalibrationHelper:    面包板校准交互 (自动检测)
+  - MainWindow:           UI 编排 / 信号连接 / 用户操作回调
 
 布局:
   ┌──────────────────────────────────────────────────┐
@@ -13,8 +13,8 @@ PyDracula 风格: 侧边栏 + 多页面路由 + 自定义标题栏
   ├────────┬─────────────────────────────────────────┤
   │        │                                          │
   │ 侧边栏 │        内容区 (QStackedWidget)           │
-  │        │   home:    Dashboard + 视频 (双栏)       │
-  │  导航   │   video:   视频全屏                     │
+  │        │   home:    UploadPage + Dashboard        │
+  │  导航   │   results: 标注结果图 + AI 助手侧栏     │
   │        │   chat:    AI 聊天全屏                   │
   │        │   circuit: 电路验证工具                   │
   │        │   settings:设置页                        │
@@ -26,6 +26,8 @@ PyDracula 风格: 侧边栏 + 多页面路由 + 自定义标题栏
 
 import sys
 import logging
+import cv2
+import numpy as np
 from pathlib import Path
 
 from PySide6.QtWidgets import (
@@ -34,14 +36,13 @@ from PySide6.QtWidgets import (
     QApplication, QFileDialog, QSplitter, QSizePolicy,
 )
 from PySide6.QtCore import Qt, Signal, Slot, QTimer, QPoint
-from PySide6.QtGui import QFont, QPixmap, QIcon
+from PySide6.QtGui import QFont, QPixmap, QImage, QIcon
 
 # 确保 src_v2 可导入
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from config import (
     gui as gui_cfg, vision as vision_cfg,
-    camera as cam_cfg,
     classroom as classroom_cfg,
 )
 from app_context import AppContext
@@ -49,14 +50,14 @@ from app_context import AppContext
 from .styles import GLOBAL_STYLE, ACCENT, BG_DARK, BG_MEDIUM, BORDER, TEXT, TEXT_DIM, SUCCESS, WARNING, DANGER
 from .resources import Icons
 from .sidebar import Sidebar
-from .video_panel import VideoPanel
+from .upload_page import UploadPage
 from .chat_panel import ChatPanel
 from .dashboard import Dashboard
 from .circuit_page import CircuitPage
 from .settings_page import SettingsPage
-from .workers import VideoWorker, ModelLoaderWorker, LLMWorker
-from .frame_pipeline import FramePipeline
+from .workers import ModelLoaderWorker, LLMWorker, ImageAnalysisWorker
 from .calibration import CalibrationHelper
+from vision.image_analyzer import ImageAnalyzer
 
 logger = logging.getLogger(__name__)
 
@@ -148,19 +149,19 @@ class MainWindow(QMainWindow):
     """
     LabGuardian 主窗口
 
-    架构 (v4 — 模块拆分):
+    架构 (v5 — Image-only):
       TitleBar
       ├── Sidebar (导航)
       └── QStackedWidget
-            ├── page_home    (Dashboard + VideoPanel 双栏)
-            ├── page_video   (VideoPanel 全屏)
+            ├── page_home    (UploadPage + Dashboard 双栏)
+            ├── page_results (标注结果图 + ChatPanel 侧栏)
             ├── page_chat    (ChatPanel 全屏)
             ├── page_circuit (CircuitPage)
             └── page_settings(SettingsPage)
 
     职责划分:
-      - FramePipeline:      帧处理 / OCR / 坐标映射 / 电路分析 (纯计算)
-      - CalibrationHelper:  面包板校准交互 (OpenCV 窗口 + 自动检测)
+      - ImageAnalyzer:      图片分析 / OCR / 坐标映射 / 电路建模 (纯计算)
+      - CalibrationHelper:  面包板校准交互 (自动检测)
       - MainWindow:         UI 编排 / 信号连接 / 用户操作回调
     """
 
@@ -179,47 +180,25 @@ class MainWindow(QMainWindow):
         self.resize(gui_cfg.window_size[0], gui_cfg.window_size[1])
         self.setWindowTitle(gui_cfg.window_title)
 
-        # ---- 帧处理管线 + 校准辅助 ----
-        self._pipeline = FramePipeline(self.ctx)
+        # ---- 图片分析引擎 + 校准辅助 ----
+        self._image_analyzer = ImageAnalyzer(self.ctx)
         self._calibration = CalibrationHelper(self.ctx)
 
         self._setup_ui()
         self._connect_signals()
-        self._connect_pipeline_callbacks()
+        self._connect_calibration_callbacks()
 
         # 后台加载模型
         self._start_model_loading()
 
     # ================================================================
-    # 管线回调连接
+    # 校准回调连接
     # ================================================================
 
-    def _connect_pipeline_callbacks(self):
-        """连接 FramePipeline / CalibrationHelper 的回调到 UI"""
-        self._pipeline.on_log = self._log_all
-        self._pipeline.on_rag_result = self._on_rag_result
-        self._pipeline.on_frame_processed = self._on_pipeline_frame
-
+    def _connect_calibration_callbacks(self):
+        """连接 CalibrationHelper 的回调到 UI"""
         self._calibration.on_log = self._log_all
         self._calibration.on_status = self._dashboard.update_module_status
-
-    def _on_rag_result(self, chip_model: str, detail: str, short: str):
-        """FramePipeline OCR+RAG 回调 → 推送到聊天面板"""
-        self._chat_panel.add_message(detail, "system")
-        self._chat_side.add_message(short, "system")
-
-    def _on_pipeline_frame(self, annotated):
-        """FramePipeline 处理完帧的回调 → 喂给心跳线程"""
-        if hasattr(self, '_heartbeat_worker'):
-            self._heartbeat_worker.update_frame(annotated)
-
-    @property
-    def current_detection(self):
-        return self._pipeline.current_detection
-
-    @current_detection.setter
-    def current_detection(self, value):
-        self._pipeline.current_detection = value
 
     # ================================================================
     # UI 搭建
@@ -278,16 +257,16 @@ class MainWindow(QMainWindow):
         self._sb_llm.setStyleSheet(f"color: {TEXT_DIM}; font-size: 11px;")
         sb_layout.addWidget(self._sb_llm)
 
-        self._sb_fps = QLabel("FPS: --")
-        self._sb_fps.setStyleSheet(f"color: {TEXT_DIM}; font-size: 11px;")
-        sb_layout.addWidget(self._sb_fps)
+        self._sb_analysis = QLabel("分析: 待命")
+        self._sb_analysis.setStyleSheet(f"color: {TEXT_DIM}; font-size: 11px;")
+        sb_layout.addWidget(self._sb_analysis)
 
         root_layout.addWidget(self._statusbar)
 
     def _create_pages(self):
         """创建全部页面并添加到 stack"""
 
-        # ---- page_home: 仪表盘 + 视频 双栏 ----
+        # ---- page_home: 上传页 + 仪表盘 双栏 ----
         self._page_home = QWidget()
         home_layout = QHBoxLayout(self._page_home)
         home_layout.setContentsMargins(0, 0, 0, 0)
@@ -295,9 +274,9 @@ class MainWindow(QMainWindow):
 
         home_splitter = QSplitter(Qt.Orientation.Horizontal)
 
-        # 左侧: 视频
-        self._video_panel = VideoPanel()
-        home_splitter.addWidget(self._video_panel)
+        # 左侧: 图片上传+分析
+        self._upload_page = UploadPage()
+        home_splitter.addWidget(self._upload_page)
 
         # 右侧: 仪表盘
         self._dashboard = Dashboard()
@@ -310,24 +289,32 @@ class MainWindow(QMainWindow):
 
         self._stack.addWidget(self._page_home)
 
-        # ---- page_video: 全屏视频 + 聊天侧栏 ----
-        self._page_video = QWidget()
-        video_layout = QHBoxLayout(self._page_video)
-        video_layout.setContentsMargins(0, 0, 0, 0)
-        video_layout.setSpacing(0)
+        # ---- page_results: 标注结果图 + 聊天侧栏 ----
+        self._page_results = QWidget()
+        results_layout = QHBoxLayout(self._page_results)
+        results_layout.setContentsMargins(0, 0, 0, 0)
+        results_layout.setSpacing(0)
 
-        video_splitter = QSplitter(Qt.Orientation.Horizontal)
-        self._video_panel_full = VideoPanel()
-        video_splitter.addWidget(self._video_panel_full)
+        results_splitter = QSplitter(Qt.Orientation.Horizontal)
+
+        self._result_image = QLabel()
+        self._result_image.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._result_image.setStyleSheet(
+            f"background-color: {BG_MEDIUM}; "
+            f"border: 1px solid {BORDER}; border-radius: 6px;"
+        )
+        self._result_image.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        results_splitter.addWidget(self._result_image)
 
         self._chat_side = ChatPanel()
-        video_splitter.addWidget(self._chat_side)
-        video_splitter.setSizes([800, 350])
-        video_splitter.setStretchFactor(0, 3)
-        video_splitter.setStretchFactor(1, 1)
-        video_layout.addWidget(video_splitter)
+        results_splitter.addWidget(self._chat_side)
+        results_splitter.setSizes([800, 350])
+        results_splitter.setStretchFactor(0, 3)
+        results_splitter.setStretchFactor(1, 1)
+        results_layout.addWidget(results_splitter)
 
-        self._stack.addWidget(self._page_video)
+        self._stack.addWidget(self._page_results)
 
         # ---- page_chat: 聊天全屏 ----
         self._chat_panel = ChatPanel()
@@ -344,7 +331,7 @@ class MainWindow(QMainWindow):
         # 页面名->索引映射
         self._page_map = {
             "home":     0,
-            "video":    1,
+            "results":  1,
             "chat":     2,
             "circuit":  3,
             "settings": 4,
@@ -363,11 +350,9 @@ class MainWindow(QMainWindow):
         # 侧边栏导航
         self._sidebar.page_changed.connect(self._switch_page)
 
-        # 视频面板信号
-        for vp in [self._video_panel, self._video_panel_full]:
-            vp.calibrate_requested.connect(self._start_calibration)
-            vp.load_image_requested.connect(self._load_image)
-            vp.conf_changed.connect(self._on_conf_changed)
+        # 上传页信号
+        self._upload_page.analyze_requested.connect(self._start_analysis)
+        self._upload_page.calibrate_requested.connect(self._start_calibration_image)
 
         # 聊天信号
         self._chat_panel.message_sent.connect(self._ask_ai)
@@ -380,6 +365,8 @@ class MainWindow(QMainWindow):
         self._circuit_page.validate_requested.connect(self._validate_circuit)
         self._circuit_page.show_netlist_requested.connect(self._show_netlist)
         self._circuit_page.reset_requested.connect(self._reset_analyzer)
+        self._circuit_page.rail_assigned.connect(self._on_rail_assigned)
+        self._circuit_page.rail_cleared.connect(self._on_rail_cleared)
 
         # ---- 课堂模式: 心跳上报 + 教师指导接收 ----
         if classroom_cfg.enabled:
@@ -422,7 +409,7 @@ class MainWindow(QMainWindow):
     @Slot(bool)
     def _on_model_loaded(self, success: bool):
         if success:
-            self._sb_status.setText(f"{Icons.OK} 系统就绪")
+            self._sb_status.setText(f"{Icons.OK} 系统就绪 - 请上传图片开始分析")
             self._sb_status.setStyleSheet(f"color: {SUCCESS}; font-size: 11px;")
             self._dashboard.update_system_status("就绪", SUCCESS)
             self._dashboard.update_module_status("vision", True, "YOLO-OBB 已加载")
@@ -453,8 +440,7 @@ class MainWindow(QMainWindow):
         if self.ctx.llm.rag_ready:
             self._dashboard.update_module_status("rag", True, f"RAG: {self.ctx.llm.rag.doc_count} 知识块")
 
-        # 启动视频线程
-        self._start_video()
+        self._dashboard.add_log("系统就绪, 请上传电路图片进行分析")
 
     # ================================================================
     # 课堂模式 (心跳上报 + 教师指导接收)
@@ -510,69 +496,93 @@ class MainWindow(QMainWindow):
         # 不在断开时覆盖状态 (避免频繁闪烁)
 
     # ================================================================
-    # 视频管线
+    # 图片分析
     # ================================================================
 
-    def _start_video(self):
-        self._video_worker = VideoWorker(
-            device_id=cam_cfg.device_id,
-            backend=cam_cfg.cv2_backend,
-        )
-        self._video_worker.set_process_callback(self._pipeline.process_frame)
+    def _start_analysis(self):
+        """UploadPage '开始分析' 按钮 → 启动 ImageAnalysisWorker"""
+        images = self._upload_page.get_images()
+        if not images:
+            return
 
-        # 连接帧信号到两个视频面板
-        self._video_worker.frame_ready.connect(self._video_panel.update_frame)
-        self._video_worker.frame_ready.connect(self._video_panel_full.update_frame)
-        self._video_worker.fps_updated.connect(self._on_fps_updated)
-        self._video_worker.error.connect(self._on_video_error)
+        conf = self._upload_page.get_confidence()
+        imgsz = self._upload_page.get_resolution()
 
-        self._video_worker.start()
-        self._dashboard.add_log("视频流已启动")
+        self._upload_page.set_analyzing(True)
+        self._sb_analysis.setText("分析: 运行中...")
+        self._sb_analysis.setStyleSheet(f"color: {WARNING}; font-size: 11px;")
+        self._log_all(f"开始分析 {len(images)} 张图片 (conf={conf}, imgsz={imgsz})")
 
-        # 如果课堂模式, 把 FPS 喂给心跳线程
-        if hasattr(self, '_heartbeat_worker'):
-            self._video_worker.fps_updated.connect(self._heartbeat_worker.update_fps)
-
-    @Slot(float)
-    def _on_fps_updated(self, fps: float):
-        self._video_panel.update_fps(fps)
-        self._video_panel_full.update_fps(fps)
-        self._dashboard.update_fps(fps)
-        self._sb_fps.setText(f"FPS: {fps:.1f}")
-        color = SUCCESS if fps >= 15 else (WARNING if fps >= 8 else DANGER)
-        self._sb_fps.setStyleSheet(f"color: {color}; font-size: 11px;")
+        self._analysis_worker = ImageAnalysisWorker(
+            self._image_analyzer, images, conf, imgsz)
+        self._analysis_worker.progress.connect(self._on_analysis_progress)
+        self._analysis_worker.finished.connect(self._on_analysis_finished)
+        self._analysis_worker.error.connect(self._on_analysis_error)
+        self._analysis_worker.start()
 
     @Slot(str)
-    def _on_video_error(self, msg: str):
-        self._dashboard.add_log(f"[Video] {msg}")
+    def _on_analysis_progress(self, msg: str):
+        """分析进度更新"""
+        self._upload_page.set_progress(msg)
+        self._sb_analysis.setText(f"分析: {msg}")
 
-    def _on_conf_changed(self, value: float):
-        """置信度阈值变更"""
-        vision_cfg.conf_threshold = value
+    @Slot(object)
+    def _on_analysis_finished(self, result):
+        """分析完成 → 显示结果"""
+        self._upload_page.set_analyzing(False)
+        self._upload_page.show_result(result)
 
-    # ================================================================
-    # 用户操作回调 (校准 / 图片加载)
-    # ================================================================
+        # 更新状态栏
+        n = result.component_count
+        self._sb_detect.setText(f"检测: {n} 个元件")
+        self._sb_detect.setStyleSheet(f"color: {SUCCESS}; font-size: 11px;")
+        self._sb_analysis.setText("分析: 完成")
+        self._sb_analysis.setStyleSheet(f"color: {SUCCESS}; font-size: 11px;")
 
-    def _start_calibration(self):
-        """校准 — 委托给 CalibrationHelper"""
-        self._dashboard.add_log("启动校准...")
-        self._calibration.start_calibration(self._video_worker)
-
-    def _load_image(self):
-        path, _ = QFileDialog.getOpenFileName(
-            self, "选择电路图片", "",
-            "图片 (*.jpg *.png *.jpeg *.bmp)"
+        # 更新结果页大图
+        pixmap = self._cv2_to_qpixmap(result.annotated_image)
+        available = self._result_image.size()
+        scaled = pixmap.scaled(
+            available, Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
         )
-        if path:
-            if self._video_worker.load_image(path):
-                name = Path(path).name
-                self._log_all(f"已加载: {name}")
-                self._dashboard.add_log(f"加载测试图片: {name}")
-                # 自动检测面包板并校准
-                frame = self._video_worker.static_frame
-                if frame is not None:
-                    self._calibration.auto_detect_board(frame)
+        self._result_image.setPixmap(scaled)
+
+        # 喂给心跳线程
+        if hasattr(self, '_heartbeat_worker'):
+            self._heartbeat_worker.update_frame(result.annotated_image)
+
+        # 检查未标注电源轨
+        unassigned = self.ctx.get_unassigned_active_rails()
+        if unassigned:
+            self._handle_rail_notification_list(unassigned)
+
+        self._log_all(
+            f"分析完成: {result.component_count} 个元件, "
+            f"{result.net_count} 个网络"
+        )
+
+    @Slot(str)
+    def _on_analysis_error(self, error_msg: str):
+        """分析出错"""
+        self._upload_page.set_analyzing(False)
+        self._sb_analysis.setText("分析: 错误")
+        self._sb_analysis.setStyleSheet(f"color: {DANGER}; font-size: 11px;")
+        self._log_all(f"分析错误: {error_msg}")
+
+    def _start_calibration_image(self, image):
+        """从上传的图片执行校准"""
+        self._dashboard.add_log("从图片执行校准...")
+        self._calibration.auto_detect_board(image)
+
+    @staticmethod
+    def _cv2_to_qpixmap(frame: np.ndarray) -> QPixmap:
+        """BGR ndarray → QPixmap"""
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        h, w, ch = rgb.shape
+        bytes_per_line = ch * w
+        qimg = QImage(rgb.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
+        return QPixmap.fromImage(qimg.copy())
 
     # ================================================================
     # 电路操作 (主线程, 需要 read_lock)
@@ -589,6 +599,30 @@ class MainWindow(QMainWindow):
         """重置分析器 (主线程, 通过 AppContext 线程安全方法)"""
         self.ctx.reset_analysis()
         self._log_all("分析器已重置")
+
+    # ================================================================
+    # 电源轨标注
+    # ================================================================
+
+    @Slot(str, str)
+    def _on_rail_assigned(self, track_id: str, label: str):
+        """学生在 circuit_page 标注了某条轨道"""
+        self.ctx.set_rail_assignment(track_id, label)
+        self._log_all(f"电源轨 {track_id} 已标注为: {label}")
+
+    @Slot()
+    def _on_rail_cleared(self):
+        """学生清除了所有轨道标注"""
+        self.ctx.clear_rail_assignments()
+        self._log_all("所有电源轨标注已清除")
+
+    def _handle_rail_notification_list(self, unassigned_rails: list):
+        """处理电源轨未标注提示"""
+        if not unassigned_rails:
+            return
+        names = ", ".join(unassigned_rails)
+        self._log_all(f"检测到电源轨连接, 请标注用途: {names}")
+        self._circuit_page.highlight_unassigned_rails(unassigned_rails)
 
     def _set_golden_ref(self):
         """设置金标准 (主线程, read_lock 保护)"""
@@ -650,7 +684,7 @@ class MainWindow(QMainWindow):
         missing_links = results.get('missing_links', [])
         self.ctx.set_missing_links(missing_links)
         if missing_links:
-            output += f"\n缺失连接: {len(missing_links)} 处 (已在视频中标注)"
+            output += f"\n缺失连接: {len(missing_links)} 处"
 
         # 显示缺失/多余元件摘要
         missing_c = results.get('missing_components', [])
@@ -671,8 +705,7 @@ class MainWindow(QMainWindow):
     def _ask_ai(self, question: str):
         """处理 AI 问答请求 (主线程)
 
-        使用 ctx.get_circuit_snapshot() 获取电路描述, 无需加锁,
-        因为快照是在 _process_frame 的写锁内更新的字符串副本。
+        使用 ctx.get_circuit_snapshot() 获取电路描述, 无需加锁.
         """
         if not question:
             return
@@ -719,8 +752,8 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         """窗口关闭时清理资源"""
-        if hasattr(self, '_video_worker'):
-            self._video_worker.stop()
+        if hasattr(self, '_analysis_worker') and self._analysis_worker.isRunning():
+            self._analysis_worker.wait(3000)
         if hasattr(self, '_heartbeat_worker'):
             self._heartbeat_worker.stop()
         event.accept()

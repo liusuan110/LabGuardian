@@ -27,6 +27,13 @@ class Icons:
     AI         = "🤖"
     QUIT       = "❌"
 
+    # 图片分析
+    UPLOAD     = "📤"
+    ANALYZE    = "🔍"
+    RESULT     = "📊"
+    IMAGE      = "🖼️"
+    CLEAR      = "🗑️"
+
     # 状态
     OK         = "🟢"
     WARN       = "🟡"

@@ -27,6 +27,7 @@ from typing import Optional, Tuple, List
 from .circuit import (
     CircuitComponent, Polarity, PinRole,
     POLARIZED_TYPES, THREE_PIN_TYPES, NON_POLAR_TYPES, CAPACITOR_TYPES,
+    IC_TYPES, POTENTIOMETER_TYPES,
     norm_component_type,
 )
 
@@ -85,10 +86,14 @@ class PolarityResolver:
 
         if norm_type in POLARIZED_TYPES:
             self._resolve_diode_polarity(comp, obb_corners, orientation_deg)
+        elif norm_type in POTENTIOMETER_TYPES:
+            self._resolve_potentiometer_pins(comp, obb_corners, orientation_deg)
         elif norm_type in THREE_PIN_TYPES:
             self._resolve_transistor_pins(comp, obb_corners, orientation_deg)
         elif norm_type == "CAPACITOR":
             self._resolve_capacitor_polarity(comp, obb_corners, orientation_deg)
+        elif norm_type in IC_TYPES:
+            self._resolve_ic_pins(comp)
         else:
             comp.polarity = Polarity.UNKNOWN
             self.stats['unknown'] += 1
@@ -233,6 +238,76 @@ class PolarityResolver:
         self.stats['unknown'] += 1
         logger.debug(f"[Polarity] {comp.name}: Capacitor polarity UNKNOWN "
                      f"(needs visual analysis)")
+
+    # ====================================================================
+    # 变阻器 (电位器) 引脚推断
+    # ====================================================================
+
+    def _resolve_potentiometer_pins(self,
+                                    comp: CircuitComponent,
+                                    obb_corners: Optional[np.ndarray],
+                                    orientation_deg: float):
+        """电位器 3 引脚推断。
+
+        与三极管相同逻辑: pin1=Terminal_A, pin3=Wiper(中间), pin2=Terminal_B。
+        pin3_loc 由视觉检测或中点回退设置。
+        """
+        if comp.pin1_loc is None or comp.pin2_loc is None:
+            comp.polarity = Polarity.NONE
+            comp.pin_roles = (PinRole.GENERIC, PinRole.GENERIC)
+            self.stats['unknown'] += 1
+            return
+
+        try:
+            row1 = int(comp.pin1_loc[0])
+            row2 = int(comp.pin2_loc[0])
+            col1 = comp.pin1_loc[1]
+        except (ValueError, TypeError):
+            comp.polarity = Polarity.NONE
+            comp.pin_roles = (PinRole.GENERIC, PinRole.GENERIC)
+            self.stats['unknown'] += 1
+            return
+
+        row_span = abs(row2 - row1)
+        has_visual_pin3 = comp.pin3_loc is not None
+
+        if has_visual_pin3 or row_span >= 2:
+            if not has_visual_pin3:
+                mid_row = (min(row1, row2) + max(row1, row2)) // 2
+                comp.pin3_loc = (str(mid_row), col1)
+                logger.info(f"[Polarity] {comp.name}: POT pin3 fallback to midpoint "
+                            f"row {mid_row}")
+
+            comp.pin_roles = (PinRole.TERMINAL_A, PinRole.TERMINAL_B, PinRole.WIPER)
+            comp.polarity = Polarity.NONE
+            self.stats['resolved'] += 1
+            logger.info(f"[Polarity] {comp.name}: Potentiometer 3-pin resolved")
+        else:
+            comp.pin_roles = (PinRole.GENERIC, PinRole.GENERIC)
+            comp.polarity = Polarity.NONE
+            self.stats['unknown'] += 1
+
+    # ====================================================================
+    # IC DIP 引脚推断
+    # ====================================================================
+
+    def _resolve_ic_pins(self, comp: CircuitComponent):
+        """IC DIP 引脚增强。
+
+        如果 pin_locs 已填充 (由 image_analyzer._build_ic_component 设置),
+        则 pin_roles 已经由引脚数据库映射, 此处仅标记极性。
+        否则标记为 UNKNOWN。
+        """
+        if comp.pin_locs:
+            comp.polarity = Polarity.NONE
+            # pin_roles 已由 _build_ic_component 设置
+            self.stats['resolved'] += 1
+            logger.info(f"[Polarity] {comp.name}: IC DIP {len(comp.pin_locs)}-pin resolved"
+                        f" (model={comp.ic_model})")
+        else:
+            comp.polarity = Polarity.UNKNOWN
+            self.stats['unknown'] += 1
+            logger.debug(f"[Polarity] {comp.name}: IC DIP no pin_locs, marked UNKNOWN")
 
     # ====================================================================
     # 辅助方法
