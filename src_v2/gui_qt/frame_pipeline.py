@@ -9,7 +9,7 @@ LabGuardian 帧处理管线
   - 检测稳定化
   - 坐标映射 (帧像素 → 面包板逻辑坐标)
   - 电路分析 (构建 CircuitComponent 并加入 Analyzer)
-  - 帧标注 (坐标标签 / 幽灵线 / OCR 标签)
+  - 帧标注 (坐标标签 / OCR 标签)
   - OCR 芯片丝印识别 + RAG 自动检索
 """
 
@@ -89,7 +89,6 @@ class FramePipeline:
           - 在 VideoWorker 线程中执行
           - 通过 ctx.write_lock() 保护 analyzer / stabilizer 的写操作
           - OCR 缓存通过 ctx.ocr_cache_* 线程安全方法访问
-          - 幽灵线通过 ctx.get_missing_links() 读取
         """
         ctx = self.ctx
 
@@ -229,11 +228,6 @@ class FramePipeline:
         if skipped:
             cv2.putText(annotated, "SKIP", (20, 70),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (128, 128, 128), 2)
-
-        # ---- 6. 幽灵线 ----
-        missing_links = ctx.get_missing_links()
-        if missing_links:
-            self.draw_ghost_wires(annotated, missing_links)
 
         # ---- 7. OCR 芯片丝印识别 ----
         ctx._ocr_frame_skip += 1
@@ -482,20 +476,3 @@ class FramePipeline:
                 cv2.putText(frame, label, (x1 + 2, y2 + th + 5),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
 
-    # ================================================================
-    # 绘制辅助
-    # ================================================================
-
-    def draw_ghost_wires(self, frame: np.ndarray, missing_links: list):
-        """绘制缺失连接的幽灵线引导"""
-        for pin1_loc, pin2_loc in missing_links:
-            try:
-                p1 = self.ctx.calibrator.logic_to_frame_pixel(pin1_loc[0], pin1_loc[1])
-                p2 = self.ctx.calibrator.logic_to_frame_pixel(pin2_loc[0], pin2_loc[1])
-                if p1 and p2:
-                    cv2.arrowedLine(frame, p1, p2, (0, 255, 255), 3, tipLength=0.2)
-                    mid = ((p1[0] + p2[0]) // 2, (p1[1] + p2[1]) // 2)
-                    cv2.putText(frame, "MISSING", mid,
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
-            except Exception:
-                pass

@@ -208,7 +208,7 @@ class CircuitValidator:
             dict 包含以下键::
 
                 errors             文字描述的差异列表
-                missing_links      缺失连接坐标 (用于幽灵线绘制)
+                missing_links      缺失连接坐标
                 extra_links        多余连接坐标
                 is_match           是否完全匹配
                 similarity         相似度 0.0 ~ 1.0
@@ -591,7 +591,7 @@ class CircuitValidator:
         for conn in extra_conns:
             result['errors'].append(f"🔗 Extra connection: {conn}")
 
-        # 将缺失连接映射回面包板位置 (用于 Ghost Wire 绘制)
+        # 将缺失连接映射回面包板位置
         for ref_c in self.ref_components:
             # 检查该元件的连接是否在当前电路中存在
             found = False

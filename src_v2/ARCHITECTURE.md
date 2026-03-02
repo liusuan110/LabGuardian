@@ -25,7 +25,7 @@ LabGuardian 是一个**边缘端全离线**的电子实验智能助教系统。�
 [多图 IoU 融合]                  [VF2++ 电路验证]
    |                                     |
    v                                     v
-[OCR IC 丝印 → 引脚数据库]      [极性诊断 + Ghost Wire]
+[OCR IC 丝印 → 引脚数据库]      [极性诊断]
    |                                     |
    v                                     v
 [RAG 知识检索]  <---------  [自然语言网表上下文]
@@ -96,8 +96,8 @@ GUI 层  --->  认知层 (LLM 问答)
           ---------    ---------   ---------   -----------
           detector     analyzer    llm         ReadWriteLock
           calibrator   polarity    ocr         _ocr_lock
-                       validator               _ghost_lock
-                       ic_pinout               _desc_lock
+                       validator               _desc_lock
+                       ic_pinout
 ```
 
 ### 3.1 为什么引入 AppContext
@@ -337,7 +337,7 @@ class AnalysisResult:
   |
   +-- 报告生成 + 标注绘制:
         _generate_report() → 结构化文本
-        _annotate() → 带框/标签/幽灵线的标注图
+        _annotate() → 带框/标签的标注图
   |
   v
 输出: AnalysisResult
@@ -627,7 +627,7 @@ ChatPanel.message_sent(str) → LLMWorker → response_ready(str)
 |  检查未标注电源轨 → 提示学生标注                                |
 |                                                                |
 |  用户标注电源轨 → ctx.set_rail_assignment()                    |
-|  用户验证电路 → validator.compare() → ghost_wires              |
+|  用户验证电路 → validator.compare() → 差异报告                |
 |  用户提问 → LLMWorker(snapshot) → ChatPanel                    |
 +----------------------------------------------------------------+
 ```
@@ -824,7 +824,6 @@ LabGuardian/
 | VF2++ | 图同构匹配算法 |
 | GED | Graph Edit Distance, 图编辑距离 |
 | Hub 节点 | IC 多引脚的中心虚拟节点 |
-| Ghost Wire | 幽灵线, 缺失连接的标注引导 |
 | Golden Reference | 教师预设的正确电路模板 |
 | 导通组 | 面包板上 5 孔组: Row{n}_L (a-e) / Row{n}_R (f-j) |
 | 骨架化 | 二值图迭代腐蚀至单像素宽 (Zhang-Suen) |

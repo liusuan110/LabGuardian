@@ -408,29 +408,10 @@ class ImageAnalyzer:
         except Exception:
             pass
 
-        # 幽灵线
-        missing_links = ctx.get_missing_links()
-        if missing_links:
-            self._draw_ghost_wires(annotated, missing_links)
-
         # OCR 标签
         self._draw_ocr_labels(annotated, detections)
 
         return annotated
-
-    def _draw_ghost_wires(self, frame: np.ndarray, missing_links: list):
-        """绘制缺失连接的幽灵线引导."""
-        for pin1_loc, pin2_loc in missing_links:
-            try:
-                p1 = self.ctx.calibrator.logic_to_frame_pixel(pin1_loc[0], pin1_loc[1])
-                p2 = self.ctx.calibrator.logic_to_frame_pixel(pin2_loc[0], pin2_loc[1])
-                if p1 and p2:
-                    cv2.arrowedLine(frame, p1, p2, (0, 255, 255), 3, tipLength=0.2)
-                    mid = ((p1[0] + p2[0]) // 2, (p1[1] + p2[1]) // 2)
-                    cv2.putText(frame, "MISSING", mid,
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
-            except Exception:
-                pass
 
     def _draw_ocr_labels(self, frame: np.ndarray, detections: List[Detection]):
         """在帧上绘制已识别的芯片型号标签."""

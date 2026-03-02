@@ -134,10 +134,6 @@ class AppContext:
         self._ocr_lock = threading.Lock()
         self._ocr_cache: Dict[str, str] = {}   # cache_key -> chip_model
 
-        # ---- 幽灵线数据 (主线程写, 分析线程读) ----
-        self._ghost_lock = threading.Lock()
-        self._ar_missing_links: list = []
-
         # ---- RAG 已查询型号缓存 ----
         self._rag_queried_models: Set[str] = set()
 
@@ -222,18 +218,6 @@ class AppContext:
             return dict(self._ocr_cache)
 
     # ================================================================
-    # 幽灵线数据 (线程安全)
-    # ================================================================
-
-    def set_missing_links(self, links: list):
-        with self._ghost_lock:
-            self._ar_missing_links = list(links)
-
-    def get_missing_links(self) -> list:
-        with self._ghost_lock:
-            return list(self._ar_missing_links)
-
-    # ================================================================
     # 模型加载
     # ================================================================
 
@@ -297,6 +281,5 @@ class AppContext:
             self.analyzer.reset()
             self.stabilizer.clear()
         self.ocr_cache_clear()
-        self.set_missing_links([])
         self._rag_queried_models.clear()
         self._circuit_description_snapshot = ""
