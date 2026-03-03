@@ -90,7 +90,7 @@ class PolarityResolver:
             self._resolve_potentiometer_pins(comp, obb_corners, orientation_deg)
         elif norm_type in THREE_PIN_TYPES:
             self._resolve_transistor_pins(comp, obb_corners, orientation_deg)
-        elif norm_type == "CAPACITOR":
+        elif norm_type in CAPACITOR_TYPES:
             self._resolve_capacitor_polarity(comp, obb_corners, orientation_deg)
         elif norm_type in IC_TYPES:
             self._resolve_ic_pins(comp)

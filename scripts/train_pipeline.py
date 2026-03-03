@@ -53,14 +53,17 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DATASET_DIR = PROJECT_ROOT / "dataset"
 MODELS_DIR = PROJECT_ROOT / "models"
 
-# 类别定义 — 必须与 data.yaml 和 config.py 完全一致
+# 类别定义 — 严格匹配 Roboflow data.yaml 的 ID 顺序
 CLASS_NAMES = [
-    "CAPACITOR",    # 0: 电容
-    "DIODE",        # 1: 二极管
-    "LED",          # 2: 发光二极管
-    "RESISTOR",     # 3: 电阻
-    "Push_Button",  # 4: 按钮
-    "Wire",         # 5: 导线
+    "Ceramic_Capacitor",       # 0: 陶瓷电容
+    "IC",                      # 1: 集成电路 (DIP 封装)
+    "LED",                     # 2: 发光二极管
+    "Transistor",              # 3: 三极管 (TO-92)
+    "Diode",                   # 4: 二极管
+    "Electrolytic_Capacitor",  # 5: 电解电容
+    "Potentiometer",           # 6: 电位器
+    "Resistor",                # 7: 电阻
+    "Wire",                    # 8: 导线
 ]
 
 

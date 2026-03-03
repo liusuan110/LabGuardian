@@ -694,11 +694,11 @@ class CircuitValidator:
 
                 if ref_pol in ('forward', 'reverse') and cur_pol in ('forward', 'reverse'):
                     if ref_pol != cur_pol:
-                        if ctype in {'LED', 'DIODE'}:
+                        if ctype in {'LED', 'Diode', 'Electrolytic_Capacitor'}:
                             result['errors'].append(
                                 f"🔴 {ctype} ({curr_node}) 接反了！"
                                 f"请将阳极(+)和阴极(-)对调")
-                        elif ctype in {'TRANSISTOR', 'NPN', 'PNP'}:
+                        elif ctype in {'Transistor', 'NPN', 'PNP'}:
                             result['errors'].append(
                                 f"🔴 {ctype} ({curr_node}) 引脚方向错误！"
                                 f"请检查 B/C/E 引脚接法")
@@ -790,7 +790,7 @@ class CircuitValidator:
                     for neighbor in g.neighbors(node):
                         edge_data = g.get_edge_data(node, neighbor)
                         if edge_data and norm_component_type(
-                                edge_data.get('type', '')) == "RESISTOR":
+                                edge_data.get('type', '')) == "Resistor":
                             has_resistor = True
                             break
                     if has_resistor:
@@ -808,7 +808,7 @@ class CircuitValidator:
             if comp.pin2_loc:
                 n1 = analyzer._get_node_name(comp.pin1_loc)
                 n2 = analyzer._get_node_name(comp.pin2_loc)
-                if n1 == n2 and ctype not in ("WIRE",):
+                if n1 == n2 and ctype not in ("Wire",):
                     issues.append(
                         f"{comp.name}: {ctype}两引脚在同一导通组({n1}), "
                         f"元件被短路或未正确跨行插入")
@@ -822,7 +822,7 @@ class CircuitValidator:
         # --- 5. 孤立元件 (度 = 1,只有一端接入网络) ---
         for comp in analyzer.components:
             ctype = norm_component_type(comp.type)
-            if ctype == "WIRE":
+            if ctype == "Wire":
                 continue
             nodes_of_comp = set()
             nodes_of_comp.add(analyzer._get_node_name(comp.pin1_loc))

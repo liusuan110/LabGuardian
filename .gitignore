@@ -64,3 +64,10 @@ teacher/frontend/.vite/
 
 # ===== Logs =====
 logs/
+
+# ===== Test output images =====
+test_results/
+
+# ===== Debug output images =====
+**/occupancy_debug_*
+**/pin_model_debug_*

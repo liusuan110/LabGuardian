@@ -52,6 +52,7 @@ class CircuitPage(QFrame):
     load_template_requested  = Signal()
     validate_requested       = Signal()
     show_netlist_requested   = Signal()
+    export_netlist_requested = Signal()
     reset_requested          = Signal()
     rail_assigned            = Signal(str, str)   # (track_id, label)
     rail_cleared             = Signal()
@@ -82,7 +83,8 @@ class CircuitPage(QFrame):
             (f"{Icons.SAVE} 保存模板",       self.save_template_requested,  1, 0, None),
             (f"{Icons.LOAD_IMG} 加载模板",   self.load_template_requested,  1, 1, None),
             (f"{Icons.NETLIST} 网表",        self.show_netlist_requested,   2, 0, None),
-            (f"{Icons.RESET} 重置分析器",    self.reset_requested,          2, 1, "danger"),
+            (f"{Icons.SAVE} 导出网表",       self.export_netlist_requested, 2, 1, None),
+            (f"{Icons.RESET} 重置分析器",    self.reset_requested,          3, 0, "danger"),
         ]
         for text, signal, row, col, style_id in buttons:
             btn = QPushButton(text)

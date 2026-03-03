@@ -26,6 +26,7 @@ from logic.validator import CircuitValidator
 from ai.ocr_engine import OCR_TARGET_CLASSES
 from vision.wire_analyzer import WireAnalyzer
 from vision.detector import Detection
+from vision.pin_hole_detector import PinHoleDetector
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +56,7 @@ class ImageAnalyzer:
     def __init__(self, ctx: AppContext):
         self.ctx = ctx
         self.wire_analyzer = WireAnalyzer()
+        self.pin_hole_detector = PinHoleDetector()
 
     # ================================================================
     # 主入口
@@ -95,8 +97,28 @@ class ImageAnalyzer:
         # ---- 1. 校准 (使用第一张图片) ----
         _progress("校准面包板...")
         if not ctx.calibrator.is_calibrated:
-            from vision.calibrator import board_calibrator
-            board_calibrator.auto_detect_board(primary)
+            success = ctx.calibrator.auto_calibrate(primary)
+            if success:
+                hole_count = len(ctx.calibrator.hole_centers)
+                roi = ctx.calibrator.get_roi_rect(
+                    primary.shape, padding=vision_cfg.roi_padding)
+                ctx._roi_rect = roi
+                logger.info(f"[ImageAnalyzer] 自动校准成功: {hole_count} 孔洞, ROI={roi}")
+            else:
+                logger.warning("[ImageAnalyzer] 自动校准失败, 尝试全图线性回退")
+                # 回退: 用整张图片作为面包板区域 (粗略校准)
+                h, w = primary.shape[:2]
+                margin = 0.05
+                corners = np.array([
+                    [w * margin, h * margin],
+                    [w * (1 - margin), h * margin],
+                    [w * (1 - margin), h * (1 - margin)],
+                    [w * margin, h * (1 - margin)],
+                ], dtype=np.float32)
+                ctx.calibrator.calibrate(corners)
+                warped = ctx.calibrator.warp(primary)
+                ctx.calibrator.detect_holes(warped)
+                logger.info(f"[ImageAnalyzer] 回退校准: {len(ctx.calibrator.hole_centers)} 孔洞")
 
         # ---- 2. 逐张检测 ----
         all_det_lists: List[List[Detection]] = []
@@ -113,9 +135,19 @@ class ImageAnalyzer:
         else:
             merged = self._fuse_detections(all_det_lists)
 
+        # ---- 3.5 视觉引脚-孔洞占用检测 ----
+        _progress("分析引脚插入位置...")
+        occupancy_map = {}
+        if ctx.calibrator.is_calibrated:
+            try:
+                occupancy_map = self.pin_hole_detector.detect_occupied_holes(
+                    primary, ctx.calibrator)
+            except Exception as e:
+                logger.warning(f"[ImageAnalyzer] 孔洞占用检测失败: {e}")
+
         # ---- 4. 坐标映射 + 电路分析 ----
         _progress("电路分析...")
-        net_count, report = self._build_circuit(merged, primary)
+        net_count, report = self._build_circuit(merged, primary, occupancy_map)
 
         # ---- 5. OCR ----
         _progress("芯片识别...")
@@ -266,8 +298,14 @@ class ImageAnalyzer:
 
     def _build_circuit(
         self, detections: List[Detection], image: np.ndarray,
+        occupancy_map: Dict = None,
     ) -> Tuple[int, str]:
-        """坐标映射 + 电路拓扑建模, 返回 (网络数, 电路描述快照)."""
+        """坐标映射 + 电路拓扑建模, 返回 (网络数, 电路描述快照).
+
+        引脚定位策略:
+          1. 视觉占用检测 (优先): 通过图像分析判断哪些孔洞被引脚占用
+          2. 几何候选匹配 (回退): OBB 延伸 + 最近孔洞候选 + 约束评分
+        """
         ctx = self.ctx
 
         with ctx.write_lock():
@@ -277,21 +315,44 @@ class ImageAnalyzer:
                 return 0, ""
 
             k = circuit_cfg.pin_candidate_k
+            use_visual = bool(occupancy_map)
 
             for det in detections:
                 if not det.pin1_pixel or not det.pin2_pixel:
                     continue
 
-                cands1 = ctx.calibrator.frame_pixel_to_logic_candidates(
-                    *det.pin1_pixel, k=k)
-                cands2 = ctx.calibrator.frame_pixel_to_logic_candidates(
-                    *det.pin2_pixel, k=k)
+                loc1, loc2 = None, None
+                ntype = norm_component_type(det.class_name)
 
-                if not cands1 or not cands2:
-                    continue
+                # ---- 方法1: 视觉占用检测 (非Wire元件优先使用) ----
+                if use_visual and ntype != "Wire":
+                    try:
+                        vloc1, vloc2 = self.pin_hole_detector.find_component_pins(
+                            det, ctx.calibrator, occupancy_map, det.class_name)
+                        if (vloc1 and vloc2 and
+                                vloc1[0] != "Groove" and vloc2[0] != "Groove"):
+                            loc1, loc2 = vloc1, vloc2
+                            logger.info(
+                                f"[Visual] {det.class_name}: "
+                                f"{loc1[0]}-{loc1[1]} → {loc2[0]}-{loc2[1]}")
+                    except Exception as e:
+                        logger.debug(f"[Visual] {det.class_name} 失败: {e}")
 
-                loc1, loc2 = self._pick_best_pin_pair(
-                    cands1, cands2, det.class_name)
+                # ---- 方法2: 几何候选匹配 (回退) ----
+                if loc1 is None or loc2 is None:
+                    cands1 = ctx.calibrator.frame_pixel_to_logic_candidates(
+                        *det.pin1_pixel, k=k)
+                    cands2 = ctx.calibrator.frame_pixel_to_logic_candidates(
+                        *det.pin2_pixel, k=k)
+
+                    if not cands1 or not cands2:
+                        continue
+
+                    loc1, loc2 = self._pick_best_pin_pair(
+                        cands1, cands2, det.class_name)
+                    logger.info(
+                        f"[Geometric] {det.class_name}: "
+                        f"{loc1[0]}-{loc1[1]} → {loc2[0]}-{loc2[1]}")
 
                 if (loc1 and loc2 and
                         loc1[0] != "Groove" and loc2[0] != "Groove"):
@@ -299,7 +360,7 @@ class ImageAnalyzer:
                     ntype = norm_component_type(det.class_name)
 
                     # IC 多引脚: OCR 识别型号 → 引脚数据库 → 全引脚映射
-                    if ntype == "IC_DIP":
+                    if ntype == "IC":
                         ic_comp = self._build_ic_component(det, image, loc1, loc2)
                         if ic_comp:
                             obb_corners = det.obb_corners if det.is_obb else None
@@ -323,7 +384,7 @@ class ImageAnalyzer:
 
                     # 三端元件 (三极管/电位器): 搜索第三引脚
                     if (det.class_name in THREE_PIN_COMPONENTS or
-                            ntype in ("NPN", "PNP", "TRANSISTOR", "POTENTIOMETER")):
+                            ntype in ("NPN", "PNP", "Transistor", "Potentiometer")):
                         self._find_3pin_middle(det)
                         pin3 = getattr(det, '_pin3_loc', None)
                         if pin3 is not None:
@@ -457,7 +518,7 @@ class ImageAnalyzer:
         wire_count = 0
         for det in detections:
             ntype = norm_component_type(det.class_name)
-            if ntype == "WIRE":
+            if ntype == "Wire":
                 wire_count += 1
             else:
                 type_counts[ntype] += 1
@@ -497,38 +558,75 @@ class ImageAnalyzer:
 
     @staticmethod
     def _pick_best_pin_pair(candidates1, candidates2, comp_type):
-        """基于面包板约束从候选孔洞中选择最佳引脚对."""
+        """基于面包板约束从候选孔洞中选择最佳引脚对.
+
+        面包板电气约束:
+          - 同一行、同一侧(a-e 或 f-j) 的孔是导通的
+          - 两个引脚插在同一导通组 = 短路, 应极力避免
+          - 非Wire元件通常跨行或跨中缝, 同行同侧无意义
+          - 导线则不受此约束, 可以同行同侧
+          - 电源轨引脚不应被惩罚（它们是连接到电源的）
+
+        评分:
+          score = distance_to_hole_1 + distance_to_hole_2    (越小越好)
+                + 短路惩罚 (同导通组)
+                + 同行异侧惩罚 (合理但罕见, 微罚)
+                + 行跨度异常惩罚
+        """
         ctype = norm_component_type(comp_type)
-        is_wire = (ctype == "WIRE")
+        is_wire = (ctype == "Wire")
+
+        RAIL_ROWS = {"1", "2", "63", "64", "65"}  # 电源轨行号
 
         best_score = float('inf')
         best_pair = (candidates1[0][0], candidates2[0][0])
 
         for loc1, dist1 in candidates1:
             for loc2, dist2 in candidates2:
-                score = dist1 + dist2
-
                 row1, col1 = loc1
                 row2, col2 = loc2
 
+                # 基础分 = 像素距离之和
+                score = dist1 + dist2
+
+                # 跳过无效坐标
                 try:
                     r1, r2 = int(row1), int(row2)
                 except (ValueError, TypeError):
                     continue
 
+                # 判断导通组
+                is_rail1 = row1 in RAIL_ROWS or str(row1) in RAIL_ROWS
+                is_rail2 = row2 in RAIL_ROWS or str(row2) in RAIL_ROWS
+
                 group1 = 'L' if col1 in ('a', 'b', 'c', 'd', 'e') else 'R'
                 group2 = 'L' if col2 in ('a', 'b', 'c', 'd', 'e') else 'R'
-                same_group = (r1 == r2 and group1 == group2)
+
+                # 同行同侧 = 短路 (同一导通组)
+                same_conductive_group = (r1 == r2 and group1 == group2
+                                         and not is_rail1 and not is_rail2)
 
                 if not is_wire:
-                    if same_group:
+                    if same_conductive_group:
+                        # 短路: 重罚, 基本不选
                         score += circuit_cfg.pin_same_group_penalty
-                    elif r1 == r2:
-                        score += circuit_cfg.pin_same_row_penalty * 0.3
 
+                    elif r1 == r2 and group1 != group2:
+                        # 跨中缝同行: 合理配置 (如跨中缝的 IC, 电阻), 微罚
+                        score += 5.0
+
+                    # 行跨度约束
                     span = abs(r2 - r1)
-                    if span > circuit_cfg.pin_large_span_threshold:
-                        score += 20.0
+                    if span == 0 and not is_rail1 and not is_rail2:
+                        # 纯同行: 给予惩罚以鼓励跨行
+                        score += circuit_cfg.pin_same_row_penalty
+                    elif span > circuit_cfg.pin_large_span_threshold:
+                        # 跨度异常大: 可能是误匹配
+                        score += 20.0 + (span - circuit_cfg.pin_large_span_threshold) * 2.0
+
+                    # 鼓励合理跨度 (1-5 行为典型)
+                    if 1 <= span <= 5:
+                        score -= 3.0  # 奖励合理跨度
 
                 if score < best_score:
                     best_score = score
@@ -617,7 +715,7 @@ class ImageAnalyzer:
 
         comp = CircuitComponent(
             name=det.class_name,
-            type="IC_DIP",
+            type="IC",
             pin1_loc=pin_locs[0] if pin_locs else loc1,
             pin2_loc=pin_locs[1] if len(pin_locs) > 1 else loc2,
             confidence=det.confidence,

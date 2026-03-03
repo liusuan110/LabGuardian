@@ -202,6 +202,15 @@ class BreadboardCalibrator:
         self.row_centers = self._robust_bin_centers(ys, self.rows)
         self.col_centers = self._robust_bin_centers(xs, 10)
 
+        # ---- 列中心沟槽感知优化 (Groove-aware column refinement) ----
+        # 面包板有中央沟槽 (a-e 与 f-j 之间), 沟槽比列间距宽。
+        # 单纯分位数分箱会导致沟槽附近列中心偏移。
+        # 将孔洞按沟槽分为两半, 各自独立计算 5 列中心。
+        if self.col_centers is not None and len(self.col_centers) == 10:
+            refined_cols = self._refine_columns_with_groove(xs)
+            if refined_cols is not None:
+                self.col_centers = refined_cols
+
         # 网格拟合后二次过滤 + 补全
         if self.row_centers is not None and self.col_centers is not None:
             refined = self._grid_filter_and_interpolate(candidates)
@@ -699,6 +708,56 @@ class BreadboardCalibrator:
             centers.append(float(np.median(values[start:end])))
         return np.array(centers, dtype=np.float32)
 
+    def _refine_columns_with_groove(self, xs: np.ndarray) -> Optional[np.ndarray]:
+        """
+        沟槽感知列中心优化
+
+        面包板结构: 5 列 (a-e) | 沟槽 | 5 列 (f-j)
+        沟槽宽度 > 列间距, 导致简单分位数分箱在沟槽附近列中心偏移。
+
+        方法:
+          1. 检测初始 col_centers 中沟槽间距是否显著大于两侧间距
+          2. 如果沟槽已被正确识别, 将孔洞分为左右两半
+          3. 各自独立做 5-bin 分箱, 确保每侧的列中心精确
+
+        Returns:
+            优化后的 10 列中心数组, 或 None (无需/无法优化)
+        """
+        if self.col_centers is None or len(self.col_centers) != 10:
+            return None
+
+        # 计算相邻列间距
+        gaps = np.diff(self.col_centers)           # 9 个间距
+        left_gaps = gaps[:4]                        # a-b, b-c, c-d, d-e
+        right_gaps = gaps[5:]                       # f-g, g-h, h-i, i-j
+        groove_gap = gaps[4]                        # e-f (沟槽)
+
+        avg_side_gap = float(np.mean(np.concatenate([left_gaps, right_gaps])))
+
+        # 沟槽间距至少比两侧平均间距大 30% 才认为成功检测
+        if groove_gap < avg_side_gap * 1.3:
+            return None
+
+        # 分界点: 初始列e 和列f 中心的中点
+        groove_mid = (self.col_centers[4] + self.col_centers[5]) / 2.0
+
+        left_xs = np.sort(xs[xs < groove_mid])
+        right_xs = np.sort(xs[xs >= groove_mid])
+
+        if len(left_xs) < 5 or len(right_xs) < 5:
+            return None
+
+        left_cols = self._robust_bin_centers(left_xs, 5)
+        right_cols = self._robust_bin_centers(right_xs, 5)
+
+        if left_cols is None or right_cols is None:
+            return None
+
+        refined = np.concatenate([left_cols, right_cols])
+        logger.info(f"[Hole] Groove-aware column refinement: "
+                    f"groove_gap={groove_gap:.1f} vs avg_side={avg_side_gap:.1f}")
+        return refined
+
     # ========================================================
     # 自动面包板检测 + ROI
     # ========================================================
@@ -707,7 +766,11 @@ class BreadboardCalibrator:
         """
         自动检测面包板矩形区域, 返回 4 个角点 (TL, TR, BR, BL)
 
-        算法: Canny 边缘 → 膨胀连接 → 轮廓检测 → 最大四边形筛选
+        多策略融合:
+          1. Canny 边缘 + 轮廓逼近 (经典方法)
+          2. 自适应阈值 + 轮廓逼近 (户内光照不均)
+          3. 颜色分割 (面包板通常为白色/米色)
+          4. 孔洞密度区域估计 (利用面包板的孔洞特征)
 
         Args:
             frame: BGR 图像
@@ -717,12 +780,43 @@ class BreadboardCalibrator:
         """
         h, w = frame.shape[:2]
         min_area = h * w * 0.05  # 面包板至少占画面 5%
+        max_area = h * w * 0.98  # 排除全画面
 
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         blurred = cv2.GaussianBlur(gray, (11, 11), 0)
 
-        # 多组 Canny 阈值尝试 (适应不同光照)
-        for low, high in [(30, 100), (50, 150), (80, 200)]:
+        # === 策略 1: 多组 Canny 阈值 ===
+        result = self._detect_board_canny(blurred, min_area, max_area)
+        if result is not None:
+            logger.info("[AutoDetect] 策略1 (Canny) 成功")
+            return result
+
+        # === 策略 2: 自适应阈值 ===
+        result = self._detect_board_adaptive(gray, min_area, max_area)
+        if result is not None:
+            logger.info("[AutoDetect] 策略2 (自适应阈值) 成功")
+            return result
+
+        # === 策略 3: 白色区域分割 (面包板通常为白色/米色) ===
+        result = self._detect_board_color(frame, min_area, max_area)
+        if result is not None:
+            logger.info("[AutoDetect] 策略3 (颜色分割) 成功")
+            return result
+
+        # === 策略 4: 全图回退 (使用图片边界, 去掉 10% 边距) ===
+        logger.warning("[AutoDetect] 所有策略失败, 使用全图回退")
+        margin = 0.10
+        fallback = np.array([
+            [w * margin, h * margin],
+            [w * (1 - margin), h * margin],
+            [w * (1 - margin), h * (1 - margin)],
+            [w * margin, h * (1 - margin)],
+        ], dtype=np.float32)
+        return fallback
+
+    def _detect_board_canny(self, blurred, min_area, max_area):
+        """策略1: Canny + 轮廓逼近"""
+        for low, high in [(30, 100), (50, 150), (80, 200), (20, 80)]:
             edges = cv2.Canny(blurred, low, high)
             kernel = np.ones((3, 3), np.uint8)
             edges = cv2.dilate(edges, kernel, iterations=2)
@@ -734,7 +828,7 @@ class BreadboardCalibrator:
 
             for cnt in contours[:10]:
                 area = cv2.contourArea(cnt)
-                if area < min_area:
+                if area < min_area or area > max_area:
                     continue
 
                 peri = cv2.arcLength(cnt, True)
@@ -743,11 +837,77 @@ class BreadboardCalibrator:
                 if len(approx) == 4:
                     corners = approx.reshape(4, 2).astype(np.float32)
                     ordered = self._order_corners(corners)
-                    logger.info(f"[AutoDetect] 检测到面包板: area={area:.0f}, "
-                                f"corners={ordered.tolist()}")
                     return ordered
+        return None
 
-        logger.warning("[AutoDetect] 未能自动检测到面包板矩形")
+    def _detect_board_adaptive(self, gray, min_area, max_area):
+        """策略2: 自适应阈值"""
+        for block_sz in (31, 51, 71):
+            thresh = cv2.adaptiveThreshold(
+                gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                cv2.THRESH_BINARY_INV, block_sz, 5
+            )
+            kernel = np.ones((5, 5), np.uint8)
+            thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel, iterations=3)
+
+            contours, _ = cv2.findContours(
+                thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+            )
+            contours = sorted(contours, key=cv2.contourArea, reverse=True)
+
+            for cnt in contours[:5]:
+                area = cv2.contourArea(cnt)
+                if area < min_area or area > max_area:
+                    continue
+
+                peri = cv2.arcLength(cnt, True)
+                # 更宽松的逼近精度
+                for eps in (0.02, 0.03, 0.05):
+                    approx = cv2.approxPolyDP(cnt, eps * peri, True)
+                    if len(approx) == 4:
+                        corners = approx.reshape(4, 2).astype(np.float32)
+                        ordered = self._order_corners(corners)
+                        return ordered
+
+                # 如果逼近不到4点, 用最小面积矩形
+                if area > min_area * 2:
+                    rect = cv2.minAreaRect(cnt)
+                    box = cv2.boxPoints(rect)
+                    corners = box.astype(np.float32)
+                    ordered = self._order_corners(corners)
+                    return ordered
+        return None
+
+    def _detect_board_color(self, frame, min_area, max_area):
+        """策略3: 白色/米色区域分割"""
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+
+        # 面包板通常为白色 (低饱和度, 高亮度)
+        lower_white = np.array([0, 0, 150], dtype=np.uint8)
+        upper_white = np.array([180, 60, 255], dtype=np.uint8)
+        mask = cv2.inRange(hsv, lower_white, upper_white)
+
+        # 形态学闭合 (填充孔洞)
+        kernel = np.ones((15, 15), np.uint8)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=3)
+        kernel_open = np.ones((5, 5), np.uint8)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel_open, iterations=2)
+
+        contours, _ = cv2.findContours(
+            mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
+        contours = sorted(contours, key=cv2.contourArea, reverse=True)
+
+        for cnt in contours[:5]:
+            area = cv2.contourArea(cnt)
+            if area < min_area or area > max_area:
+                continue
+
+            rect = cv2.minAreaRect(cnt)
+            box = cv2.boxPoints(rect)
+            corners = box.astype(np.float32)
+            ordered = self._order_corners(corners)
+            return ordered
         return None
 
     @staticmethod

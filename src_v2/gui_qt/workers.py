@@ -177,27 +177,40 @@ class ModelLoaderWorker(QThread):
         try:
             # 1. 加载 YOLO
             self.progress.emit("正在加载视觉识别模型...")
-            if self.detector.load():
-                self.progress.emit("✅ 视觉模型加载成功")
-            else:
-                self.progress.emit("⚠️ 视觉模型加载失败，使用回退模式")
+            try:
+                if self.detector.load():
+                    self.progress.emit("视觉模型加载成功")
+                else:
+                    self.progress.emit("视觉模型加载失败，部分功能不可用")
+                    success = False
+            except Exception as e:
+                self.progress.emit(f"视觉模型加载出错: {e}")
+                logger.error(f"[ModelLoader] YOLO 加载失败: {e}")
                 success = False
 
-            # 2. 加载 LLM (+ RAG)
+            # 2. 加载 LLM (+ RAG) — 不影响核心检测功能
             self.progress.emit("正在加载语言模型...")
-            status = self.llm_engine.load()
-            self.progress.emit(f"✅ {status}")
+            try:
+                status = self.llm_engine.load()
+                self.progress.emit(f"语言模型: {status}")
+            except Exception as e:
+                self.progress.emit(f"语言模型加载出错 (AI问答不可用): {e}")
+                logger.error(f"[ModelLoader] LLM 加载失败: {e}")
 
-            # 3. 加载 OCR
+            # 3. 加载 OCR — 不影响核心检测功能
             if self.ocr_engine:
                 self.progress.emit("正在加载 OCR 丝印识别引擎...")
-                if self.ocr_engine.initialize():
-                    self.progress.emit(f"✅ OCR 已就绪 ({self.ocr_engine.backend_name})")
-                else:
-                    self.progress.emit("⚠️ OCR 未加载 (芯片丝印识别不可用)")
+                try:
+                    if self.ocr_engine.initialize():
+                        self.progress.emit(f"OCR 已就绪 ({self.ocr_engine.backend_name})")
+                    else:
+                        self.progress.emit("OCR 未加载 (芯片丝印识别不可用)")
+                except Exception as e:
+                    self.progress.emit(f"OCR 加载出错: {e}")
+                    logger.error(f"[ModelLoader] OCR 加载失败: {e}")
 
         except Exception as e:
-            self.progress.emit(f"❌ 模型加载错误: {e}")
+            self.progress.emit(f"模型加载错误: {e}")
             success = False
 
         self.finished.emit(success)

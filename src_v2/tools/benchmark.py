@@ -432,7 +432,7 @@ def benchmark_circuit_analysis() -> dict:
         for i in range(n):
             comp = CircuitComponent(
                 name=f"R{i}" if i % 3 == 0 else (f"LED{i}" if i % 3 == 1 else f"Wire{i}"),
-                type="RESISTOR" if i % 3 == 0 else ("LED" if i % 3 == 1 else "Wire"),
+                type="Resistor" if i % 3 == 0 else ("LED" if i % 3 == 1 else "Wire"),
                 pin1_loc=(str(i), "A"),
                 pin2_loc=(str(i), "B"),
                 confidence=0.9,
@@ -448,7 +448,7 @@ def benchmark_circuit_analysis() -> dict:
             for i in range(n):
                 comp = CircuitComponent(
                     name=f"R{i}",
-                    type="RESISTOR",
+                    type="Resistor",
                     pin1_loc=(str(i), "A"),
                     pin2_loc=(str(i), "B"),
                     confidence=0.9,
@@ -475,7 +475,7 @@ def benchmark_circuit_analysis() -> dict:
             for i in range(n):
                 comp = CircuitComponent(
                     name=f"R{i}" if i % 3 == 0 else (f"LED{i}" if i % 3 == 1 else f"Wire{i}"),
-                    type="RESISTOR" if i % 3 == 0 else ("LED" if i % 3 == 1 else "Wire"),
+                    type="Resistor" if i % 3 == 0 else ("LED" if i % 3 == 1 else "Wire"),
                     pin1_loc=(str(i), "A"),
                     pin2_loc=(str(i), "B"),
                     confidence=0.9,

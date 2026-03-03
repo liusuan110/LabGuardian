@@ -294,7 +294,7 @@ class RuleBasedBackend(LLMBackend):
 
     # 元件基础知识库 (扩充版)
     KNOWLEDGE_BASE = {
-        "RESISTOR": (
+        "Resistor": (
             "电阻器: 限制电流/分压。无极性, 可双向安装。\n"
             "色环读数: 从左到右读取色环值, 最后一环为误差。\n"
             "常用值: 220Ω(LED限流), 1kΩ(通用), 10kΩ(上拉/下拉), 4.7kΩ(I2C)。\n"
@@ -309,20 +309,23 @@ class RuleBasedBackend(LLMBackend):
             "  绿色LED: Vf≈2.2V, 建议 150Ω(5V)\n"
             "典型工作电流: 10-20mA。"
         ),
-        "DIODE": (
+        "Diode": (
             "二极管: 有极性! 有银色/白色色环的一端为阴极(-)。\n"
             "电流只能从阳极(+)流向阴极(-)。\n"
             "常见型号: 1N4148(信号), 1N4007(整流), 1N5819(肖特基)。\n"
             "正向压降: 硅管约0.7V, 肖特基约0.3V。"
         ),
-        "CAPACITOR": (
-            "电容器:\n"
-            "  电解电容: 有极性! 长脚为正极, 短脚为负极, 罐体有白色标记为负极。\n"
-            "    反接可能爆裂! 注意耐压值, 实际电压不得超过标称耐压的80%。\n"
-            "  瓷片/独石电容: 无极性。标注如 104 = 100nF = 0.1μF。\n"
+        "Ceramic_Capacitor": (
+            "瓷片/独石电容: 无极性。\n"
+            "标注如 104 = 100nF = 0.1μF, 103 = 10nF, 105 = 1μF。\n"
+            "常用于旁路滤波和高频去耦。"
+        ),
+        "Electrolytic_Capacitor": (
+            "电解电容: 有极性! 长脚为正极, 短脚为负极, 罐体有白色标记为负极。\n"
+            "反接可能爆裂! 注意耐压值, 实际电压不得超过标称耐压的80%。\n"
             "常用滤波搭配: 电源处并联 100μF(电解) + 0.1μF(瓷片)。"
         ),
-        "WIRE": "导线/跳线: 无极性, 用于连接面包板不同行。选用合适长度避免混乱。",
+        "Wire": "导线/跳线: 无极性, 用于连接面包板不同行。选用合适长度避免混乱。",
         "Push_Button": (
             "按钮开关 (轻触开关):\n"
             "  四脚按钮: 对角两脚始终导通, 按下时四脚全导通。\n"
@@ -330,7 +333,7 @@ class RuleBasedBackend(LLMBackend):
             "  消抖: 硬件(并联0.1μF) 或 软件(延时10-50ms)。\n"
             "  上拉接法: Vcc → 10kΩ电阻 → 引脚 → 按钮 → GND。"
         ),
-        "TRANSISTOR": (
+        "Transistor": (
             "三极管(BJT): TO-92封装, 平面朝自己时引脚定义取决于型号。\n"
             "  8050(NPN): E-B-C (左到右, 平面朝自己)。\n"
             "  8550(PNP): E-B-C (左到右, 平面朝自己)。\n"
@@ -419,13 +422,14 @@ class RuleBasedBackend(LLMBackend):
 
         # 1. 元件知识查询 (支持中英文别名)
         comp_aliases = {
-            "电阻": "RESISTOR", "阻": "RESISTOR",
+            "电阻": "Resistor", "阻": "Resistor",
             "LED": "LED", "发光二极管": "LED", "灯": "LED",
-            "二极管": "DIODE",
-            "电容": "CAPACITOR", "容": "CAPACITOR",
-            "导线": "WIRE", "跳线": "WIRE",
-            "按钮": "Push_Button", "按键": "Push_Button", "开关": "Push_Button",
-            "三极管": "TRANSISTOR", "BJT": "TRANSISTOR",
+            "二极管": "Diode",
+            "电容": "Ceramic_Capacitor", "容": "Ceramic_Capacitor",
+            "电解电容": "Electrolytic_Capacitor", "电解": "Electrolytic_Capacitor",
+            "导线": "Wire", "跳线": "Wire",
+            "按键": "Push_Button", "按钮": "Push_Button", "开关": "Push_Button",
+            "三极管": "Transistor", "BJT": "Transistor",
             "NPN": "NPN", "PNP": "PNP",
             "芯片": "IC", "集成电路": "IC",
             "运放": "OPAMP", "运算放大器": "OPAMP", "LM358": "OPAMP", "741": "OPAMP",
@@ -514,7 +518,7 @@ class RuleBasedBackend(LLMBackend):
 
         # 检查 LED 是否有限流电阻
         if "LED" in context:
-            has_resistor_near_led = "RESISTOR" in context
+            has_resistor_near_led = "Resistor" in context or "resistor" in context.lower()
             if not has_resistor_near_led:
                 issues.append(self.ERROR_PATTERNS["LED无限流电阻"])
 
@@ -538,9 +542,11 @@ class RuleBasedBackend(LLMBackend):
         # 统计各类元件数量
         comp_counts = {}
         comp_names_cn = {
-            "RESISTOR": "电阻", "LED": "LED", "CAPACITOR": "电容",
-            "DIODE": "二极管", "Wire": "导线", "Push_Button": "按钮",
-            "TRANSISTOR": "三极管", "NPN": "NPN三极管", "PNP": "PNP三极管",
+            "Resistor": "电阻", "LED": "LED",
+            "Ceramic_Capacitor": "瓷片电容",
+            "Electrolytic_Capacitor": "电解电容",
+            "Diode": "二极管", "Wire": "导线", "Push_Button": "按钮",
+            "Transistor": "三极管", "NPN": "NPN三极管", "PNP": "PNP三极管",
             "IC": "芯片", "OPAMP": "运放",
         }
         for comp_type in comp_names_cn:

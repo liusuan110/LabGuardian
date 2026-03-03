@@ -285,7 +285,7 @@ class OCRConfig:
     min_confidence: float = 0.3            # OCR 最低置信度
     # 触发 OCR 的 YOLO 检测类别 (检测到这些类别时自动 OCR)
     target_classes: tuple = (
-        "IC", "CHIP", "DIP", "IC_DIP", "TRANSISTOR", "NPN", "PNP", "BJT",
+        "IC", "CHIP", "DIP", "Transistor", "NPN", "PNP", "BJT",
         "NE555", "LM358", "OPAMP", "REGULATOR",
     )
 
@@ -354,40 +354,43 @@ class ClassroomConfig:
 # 检测类别定义
 # ============================================================
 
-# 类别列表 (与训练 data.yaml 中的顺序一致)
+# 类别列表 (严格匹配 Roboflow data.yaml 的 ID 顺序)
 COMPONENT_CLASSES = [
-    "CAPACITOR",
-    "DIODE",
-    "LED",
-    "RESISTOR",
-    "Push_Button",
-    "Wire",
-    "TRANSISTOR",       # TO-92 三极管
-    "IC_DIP",           # DIP 封装 IC (运放等)
-    "POTENTIOMETER",    # 电位器/变阻器
+    "Ceramic_Capacitor",       # 0: 陶瓷电容
+    "IC",                      # 1: 集成电路 (DIP 封装)
+    "LED",                     # 2: 发光二极管
+    "Transistor",              # 3: 三极管 (TO-92)
+    "Diode",                   # 4: 二极管
+    "Electrolytic_Capacitor",  # 5: 电解电容
+    "Potentiometer",           # 6: 电位器
+    "Resistor",                # 7: 电阻
+    "Wire",                    # 8: 导线
 ]
 
 # 类别颜色 (BGR)
 CLASS_COLORS = {
-    "CAPACITOR":      (0, 0, 255),      # Red
-    "DIODE":          (0, 255, 0),      # Green
-    "LED":            (255, 0, 0),      # Blue
-    "RESISTOR":       (0, 255, 255),    # Yellow
-    "Push_Button":    (255, 255, 0),    # Cyan
-    "Wire":           (255, 0, 255),    # Magenta
-    "TRANSISTOR":     (0, 128, 255),    # Orange
-    "IC_DIP":         (128, 0, 128),    # Purple
-    "POTENTIOMETER":  (0, 200, 200),    # Teal
+    "Ceramic_Capacitor":       (0, 0, 255),      # Red
+    "IC":                      (128, 0, 128),    # Purple
+    "LED":                     (255, 0, 0),      # Blue
+    "Transistor":              (0, 128, 255),    # Orange
+    "Diode":                   (0, 255, 0),      # Green
+    "Electrolytic_Capacitor":  (0, 200, 200),    # Teal
+    "Potentiometer":           (200, 200, 0),    # Cyan-ish
+    "Resistor":                (0, 255, 255),    # Yellow
+    "Wire":                    (255, 0, 255),    # Magenta
 }
 
 # 两端元件 (需要提取两个引脚坐标)
-TWO_PIN_COMPONENTS = {"Wire", "RESISTOR", "DIODE", "Resistor", "LED", "CAPACITOR"}
+TWO_PIN_COMPONENTS = {
+    "Wire", "Resistor", "Diode", "LED",
+    "Ceramic_Capacitor", "Electrolytic_Capacitor",
+}
 
 # 三端元件 (需要推断第三引脚)
-THREE_PIN_COMPONENTS = {"TRANSISTOR", "NPN", "PNP", "BJT", "POTENTIOMETER"}
+THREE_PIN_COMPONENTS = {"Transistor", "Potentiometer"}
 
 # IC DIP 封装元件 (多引脚, 由 OCR + 引脚数据库映射)
-IC_DIP_COMPONENTS = {"IC_DIP", "IC", "CHIP", "DIP", "OPAMP"}
+IC_DIP_COMPONENTS = {"IC"}
 
 
 # ============================================================
@@ -424,7 +427,7 @@ class CircuitConfig:
     position_tolerance_rows: int = 2       # 位置启发式匹配的行容差
 
     # --- 引脚遮挡补偿 ---
-    pin_candidate_k: int = 3              # 每个引脚返回的候选孔洞数量
+    pin_candidate_k: int = 5              # 每个引脚返回的候选孔洞数量 (增大搜索范围提升准确性)
     pin_same_group_penalty: float = 100.0  # 两引脚在同一导通组的惩罚分
     pin_same_row_penalty: float = 50.0     # 非Wire元件两引脚在同一行的惩罚分
     pin_large_span_threshold: int = 10     # 行跨度 > 此值视为异常

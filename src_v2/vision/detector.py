@@ -25,24 +25,26 @@ from config import vision as vision_cfg, find_best_yolo_model, TWO_PIN_COMPONENT
 # 参考: 电阻色环体 ≈ 6mm, 引线外露 ≈ 2-4mm → 比例 0.08-0.12
 
 _PIN_EXTENSION = {
-    "RESISTOR":       0.10,  # 电阻: 引线细长, 略超出体边
-    "Resistor":       0.10,
-    "LED":            0.08,  # LED: 引脚从底座伸出, 顶视遮挡严重
-    "DIODE":          0.10,  # 二极管: 类似电阻
-    "CAPACITOR":      0.08,  # 电容: 引脚较短
-    "Wire":           0.02,  # 导线: 端点基本就是连接点
-    "Push_Button":    0.06,  # 按钮: 引脚在底部
-    "TRANSISTOR":     0.10,  # 三极管: TO-92 引脚从封装体伸出
-    "IC_DIP":         0.02,  # IC: 引脚紧贴封装体边缘
-    "POTENTIOMETER":  0.08,  # 电位器: 引脚在底部
+    "Ceramic_Capacitor":       0.15,  # 陶瓷电容: 引脚穿过元件体 → 增大延伸
+    "IC":                      0.04,  # IC: DIP 引脚紧贴封装体边缘
+    "LED":                     0.18,  # LED: 引脚从圆形底座伸出较长
+    "Transistor":              0.15,  # 三极管: TO-92 引脚从封装体伸出
+    "Diode":                   0.15,  # 二极管: 引线细长, 大部分隐藏在封装下方
+    "Electrolytic_Capacitor":  0.15,  # 电解电容: 引脚在底部, 遮挡严重
+    "Potentiometer":           0.12,  # 电位器: 引脚在底部
+    "Resistor":                0.18,  # 电阻: 引线细长, 色环体遮挡最严重
+    "Wire":                    0.02,  # 导线: 端点基本就是连接点
 }
-_DEFAULT_PIN_EXTENSION = 0.08
+_DEFAULT_PIN_EXTENSION = 0.12
+
+# 最小延伸像素 — 即使 OBB 很小也要保证一定延伸量, 防止引脚卡在元件体内
+_MIN_EXTENSION_PX = 6
 
 
 @dataclass
 class Detection:
     """单个检测结果的结构化表示"""
-    class_name: str                           # 类别名称 (e.g. "RESISTOR")
+    class_name: str                           # 类别名称 (e.g. "Resistor")
     class_id: int                             # 类别 ID
     confidence: float                         # 置信度
     bbox: Tuple[int, int, int, int]           # 外接矩形 (x1, y1, x2, y2)
@@ -202,7 +204,7 @@ class ComponentDetector:
             dir_len = np.linalg.norm(direction)
             if dir_len > 1e-5:
                 unit_dir = direction / dir_len
-                extension = ext_ratio * long_len
+                extension = max(ext_ratio * long_len, _MIN_EXTENSION_PX)
                 pin1 = tuple((mid1 - unit_dir * extension).tolist())
                 pin2 = tuple((mid2 + unit_dir * extension).tolist())
             else:
@@ -227,12 +229,12 @@ class ComponentDetector:
         ext_ratio = _PIN_EXTENSION.get(cls_name, _DEFAULT_PIN_EXTENSION)
         if w > h:
             # 水平元件: 引脚在左右两端外侧
-            extension = w * ext_ratio
+            extension = max(w * ext_ratio, _MIN_EXTENSION_PX)
             pin1 = (x1 - extension, cy)
             pin2 = (x2 + extension, cy)
         else:
             # 垂直元件: 引脚在上下两端外侧
-            extension = h * ext_ratio
+            extension = max(h * ext_ratio, _MIN_EXTENSION_PX)
             pin1 = (cx, y1 - extension)
             pin2 = (cx, y2 + extension)
         return pin1, pin2

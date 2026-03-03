@@ -427,7 +427,7 @@ class EasyOCRBackend:
 
 # 触发 OCR 的 YOLO 检测类别 (检测到这些类别时自动裁剪+OCR)
 OCR_TARGET_CLASSES = {
-    "IC", "CHIP", "DIP", "TRANSISTOR", "NPN", "PNP", "BJT",
+    "IC", "CHIP", "DIP", "Transistor", "NPN", "PNP", "BJT",
     "NE555", "LM358", "OPAMP", "REGULATOR",
     # 当 YOLO 类别列表扩展时, 在此添加芯片相关类别即可
 }

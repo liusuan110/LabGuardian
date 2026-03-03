@@ -35,38 +35,57 @@ logger = logging.getLogger(__name__)
 def norm_component_type(t: str) -> str:
     """归一化元件类型名。
     全模块统一使用此函数, 避免 circuit.py / polarity.py 行为不一致。
+    返回值与 YOLO 训练类名对齐 (首字母大写)。
     """
     if not t:
         return "UNKNOWN"
     u = str(t).strip().upper()
+    # --- 电容 (区分瓷片/电解) ---
+    if "ELECTROLYTIC" in u:
+        return "Electrolytic_Capacitor"
+    if "CERAMIC" in u:
+        return "Ceramic_Capacitor"
+    if "CAP" in u:
+        # 未细分 → 默认瓷片 (无极性)
+        return "Ceramic_Capacitor"
+    # --- 电阻 ---
     if "RESIST" in u:
-        return "RESISTOR"
+        return "Resistor"
+    # --- 导线 ---
     if "WIRE" in u:
-        return "WIRE"
+        return "Wire"
+    # --- LED ---
     if "LED" in u:
         return "LED"
+    # --- 二极管 ---
     if "DIODE" in u:
-        return "DIODE"
+        return "Diode"
+    # --- 按键/开关 ---
     if "BUTTON" in u or "SWITCH" in u:
         return "Push_Button"
-    if "CAP" in u:
-        return "CAPACITOR"
+    # --- 三极管 ---
     if "NPN" in u:
         return "NPN"
     if "PNP" in u:
         return "PNP"
     if "TRANSISTOR" in u or "BJT" in u:
-        return "TRANSISTOR"
+        return "Transistor"
+    # --- 电位器 ---
     if "POTENTIOMETER" in u or "POT" in u or "变阻" in u:
-        return "POTENTIOMETER"
+        return "Potentiometer"
+    # --- IC ---
     if "IC_DIP" in u or ("IC" in u and "DIP" in u):
-        return "IC_DIP"
-    if "BATTERY" in u or "POWER" in u:
-        return "POWER"
+        return "IC"
     if "OPAMP" in u or "OP-AMP" in u or "OP_AMP" in u:
         return "OPAMP"
     if "555" in u:
         return "IC_555"
+    # 仅 "IC" (YOLO 输出)
+    if u == "IC":
+        return "IC"
+    # --- 电源 ---
+    if "BATTERY" in u or "POWER" in u:
+        return "POWER"
     return u
 
 
@@ -113,7 +132,7 @@ class CircuitComponent:
 
     Attributes:
         name: 元件名称 (e.g. "R1", "LED1")
-        type: 元件类型 (e.g. "RESISTOR", "LED")
+        type: 元件类型 (e.g. "Resistor", "LED")
         pin1_loc: 引脚1 坐标 (Row, Col)
         pin2_loc: 引脚2 坐标 (可为空)
         polarity: 极性方向 (由 PolarityResolver 填充)
@@ -123,7 +142,7 @@ class CircuitComponent:
         pin3_loc: 三极管第三引脚坐标
     """
     name: str          # e.g. "R1", "LED1"
-    type: str          # e.g. "RESISTOR", "Wire", "LED"
+    type: str          # e.g. "Resistor", "Wire", "LED"
     pin1_loc: Tuple[str, str]  # (行, 列) e.g. ("15", "a")
     pin2_loc: Optional[Tuple[str, str]] = None
 
@@ -158,12 +177,12 @@ class CircuitComponent:
 # 元件类型分类 (用于极性判断)
 # ============================================================
 
-POLARIZED_TYPES = {"DIODE", "LED"}                  # 有极性的二端元件
-THREE_PIN_TYPES = {"TRANSISTOR", "NPN", "PNP", "POTENTIOMETER"}  # 三端元件
-CAPACITOR_TYPES = {"CAPACITOR"}                       # 可能有极性 (电解) 也可能无极性 (瓷片)
-NON_POLAR_TYPES = {"RESISTOR", "WIRE", "Push_Button"} # 无极性元件
-IC_TYPES = {"IC_DIP", "IC_555", "OPAMP"}              # 多引脚 IC
-POTENTIOMETER_TYPES = {"POTENTIOMETER"}                # 电位器/变阻器
+POLARIZED_TYPES = {"Diode", "LED", "Electrolytic_Capacitor"}  # 有极性的二端元件
+THREE_PIN_TYPES = {"Transistor", "NPN", "PNP", "Potentiometer"}  # 三端元件
+CAPACITOR_TYPES = {"Ceramic_Capacitor", "Electrolytic_Capacitor"}  # 电容
+NON_POLAR_TYPES = {"Resistor", "Wire", "Push_Button", "Ceramic_Capacitor"}  # 无极性元件
+IC_TYPES = {"IC", "IC_555", "OPAMP"}                  # 多引脚 IC
+POTENTIOMETER_TYPES = {"Potentiometer"}                # 电位器/变阻器
 POWER_KEYWORDS = {"VCC", "GND", "POWER", "BATTERY"}  # 电源相关关键词
 
 
@@ -208,11 +227,12 @@ class CircuitAnalyzer:
 
     # ---- 元件命名 ----
     _TYPE_PREFIX = {
-        "RESISTOR": "R", "LED": "LED", "DIODE": "D",
-        "CAPACITOR": "C", "WIRE": "W", "Push_Button": "SW",
-        "TRANSISTOR": "Q", "NPN": "Q", "PNP": "Q",
+        "Resistor": "R", "LED": "LED", "Diode": "D",
+        "Ceramic_Capacitor": "C", "Electrolytic_Capacitor": "C",
+        "Wire": "W", "Push_Button": "SW",
+        "Transistor": "Q", "NPN": "Q", "PNP": "Q",
         "IC_555": "U", "OPAMP": "U", "POWER": "PWR",
-        "POTENTIOMETER": "VR", "IC_DIP": "U",
+        "Potentiometer": "VR", "IC": "U",
     }
 
     def _auto_name(self, comp_type: str) -> str:
@@ -347,7 +367,7 @@ class CircuitAnalyzer:
         conductor.add_nodes_from(self.graph.nodes())
 
         for u, v, data in self.graph.edges(data=True):
-            if self._norm_type(data.get("type", "")) == "WIRE":
+            if self._norm_type(data.get("type", "")) == "Wire":
                 conductor.add_edge(u, v)
 
         # 每个 Wire 连通分量代表一个电气网络
@@ -375,7 +395,7 @@ class CircuitAnalyzer:
         comp_idx = 0
         for comp in self.components:
             ctype = self._norm_type(comp.type)
-            if ctype == "WIRE":
+            if ctype == "Wire":
                 continue
 
             cid = f"C{comp_idx}"
@@ -604,7 +624,7 @@ class CircuitAnalyzer:
                 led_node1 = self._get_node_name(comp.pin1_loc)
                 led_node2 = self._get_node_name(comp.pin2_loc) if comp.pin2_loc else None
                 for other in self.components:
-                    if self._norm_type(other.type) == "RESISTOR":
+                    if self._norm_type(other.type) == "Resistor":
                         r_node1 = self._get_node_name(other.pin1_loc)
                         r_node2 = self._get_node_name(other.pin2_loc) if other.pin2_loc else None
                         if (r_node1 in (led_node1, led_node2) or

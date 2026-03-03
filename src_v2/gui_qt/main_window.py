@@ -364,6 +364,7 @@ class MainWindow(QMainWindow):
         self._circuit_page.load_template_requested.connect(self._load_template)
         self._circuit_page.validate_requested.connect(self._validate_circuit)
         self._circuit_page.show_netlist_requested.connect(self._show_netlist)
+        self._circuit_page.export_netlist_requested.connect(self._export_netlist)
         self._circuit_page.reset_requested.connect(self._reset_analyzer)
         self._circuit_page.rail_assigned.connect(self._on_rail_assigned)
         self._circuit_page.rail_cleared.connect(self._on_rail_cleared)
@@ -571,9 +572,12 @@ class MainWindow(QMainWindow):
         self._log_all(f"分析错误: {error_msg}")
 
     def _start_calibration_image(self, image):
-        """从上传的图片执行校准"""
+        """从上传的图片执行校准: 先尝试自动, 失败则弹出手动校准对话框"""
         self._dashboard.add_log("从图片执行校准...")
-        self._calibration.auto_detect_board(image)
+        success = self._calibration.auto_detect_board(image)
+        if not success:
+            self._dashboard.add_log("自动校准失败, 请在弹出的对话框中手动标记面包板角点")
+            self._calibration.manual_calibrate(image, parent_widget=self)
 
     @staticmethod
     def _cv2_to_qpixmap(frame: np.ndarray) -> QPixmap:
@@ -594,6 +598,46 @@ class MainWindow(QMainWindow):
             netlist = self.ctx.analyzer.get_circuit_description()
         self._circuit_page.set_result(netlist)
         self._log_all("已生成网表")
+
+    def _export_netlist(self):
+        """导出结构化网表到 JSON 文件"""
+        import json
+        with self.ctx.read_lock():
+            if not self.ctx.analyzer.components:
+                self._log_all("没有检测到元件, 无法导出网表")
+                self._circuit_page.set_result("错误: 没有检测到元件, 请先分析图片")
+                return
+            netlist_data = self.ctx.analyzer.export_netlist()
+
+        # 序列化处理: tuple → list (JSON 不支持 tuple)
+        def _serialize(obj):
+            if isinstance(obj, tuple):
+                return list(obj)
+            if isinstance(obj, set):
+                return list(obj)
+            if hasattr(obj, 'value'):
+                return obj.value
+            return str(obj)
+
+        path, _ = QFileDialog.getSaveFileName(
+            self, "导出网表", "circuit_netlist.json",
+            "JSON 文件 (*.json);;所有文件 (*)"
+        )
+        if not path:
+            return
+
+        try:
+            with open(path, 'w', encoding='utf-8') as f:
+                json.dump(netlist_data, f, ensure_ascii=False, indent=2, default=_serialize)
+            self._log_all(f"网表已导出: {Path(path).name}")
+            self._circuit_page.set_result(
+                f"网表已成功导出到:\n{path}\n\n"
+                f"包含 {len(netlist_data.get('components', []))} 个元件, "
+                f"{len(netlist_data.get('nets', {}))} 个网络"
+            )
+        except Exception as e:
+            self._log_all(f"网表导出失败: {e}")
+            self._circuit_page.set_result(f"导出失败: {e}")
 
     def _reset_analyzer(self):
         """重置分析器 (主线程, 通过 AppContext 线程安全方法)"""

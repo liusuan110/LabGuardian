@@ -1,0 +1,18 @@
+# LabGuardian 数据集配置
+# 自动生成于 2026-03-03 15:05
+
+path: D:/desktop/inter/LabGuardian/dataset
+train: train/images
+val: val/images
+
+nc: 9
+names:
+- Ceramic_Capacitor
+- IC
+- LED
+- Transistor
+- Diode
+- Electrolytic_Capacitor
+- Potentiometer
+- Resistor
+- Wire

@@ -168,10 +168,11 @@ def run_diagnostics(logger: logging.Logger) -> dict:
     logger.info(f"  Python:   {sys.version.split()[0]}")
     logger.info(f"  项目根:   {PROJECT_ROOT}")
 
-    # 摄像头检测
+    # 摄像头检测 (设置超时防止卡死)
     try:
         import cv2
-        cap = cv2.VideoCapture(0)
+        cap = cv2.VideoCapture(0, cv2.CAP_DSHOW if sys.platform == "win32" else cv2.CAP_ANY)
+        cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 3000)
         if cap.isOpened():
             w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
             h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -179,8 +180,8 @@ def run_diagnostics(logger: logging.Logger) -> dict:
             diag["camera"] = f"OK ({w}x{h})"
             cap.release()
         else:
-            logger.warning("  摄像头:   ✘ 设备 0 无法打开")
-            diag["camera"] = "FAIL"
+            logger.info("  摄像头:   △ 设备 0 无法打开 (图片模式仍可用)")
+            diag["camera"] = "N/A"
             cap.release()
     except Exception as e:
         logger.warning(f"  摄像头:   ✘ {e}")
