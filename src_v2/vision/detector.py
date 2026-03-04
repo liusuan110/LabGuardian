@@ -15,30 +15,7 @@ from ultralytics import YOLO
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from config import vision as vision_cfg, find_best_yolo_model, TWO_PIN_COMPONENTS
-
-
-# ============================================================
-# 引脚延伸先验 — 补偿元件遮挡导致的引脚位置偏差
-# ============================================================
-# OBB / HBB 只捕获元件本体, 真实引脚插入点在本体外侧。
-# 比例含义: 沿长轴方向, 每端向外延伸 (长边长度 × 比例) 个像素。
-# 参考: 电阻色环体 ≈ 6mm, 引线外露 ≈ 2-4mm → 比例 0.08-0.12
-
-_PIN_EXTENSION = {
-    "Ceramic_Capacitor":       0.15,  # 陶瓷电容: 引脚穿过元件体 → 增大延伸
-    "IC":                      0.04,  # IC: DIP 引脚紧贴封装体边缘
-    "LED":                     0.18,  # LED: 引脚从圆形底座伸出较长
-    "Transistor":              0.15,  # 三极管: TO-92 引脚从封装体伸出
-    "Diode":                   0.15,  # 二极管: 引线细长, 大部分隐藏在封装下方
-    "Electrolytic_Capacitor":  0.15,  # 电解电容: 引脚在底部, 遮挡严重
-    "Potentiometer":           0.12,  # 电位器: 引脚在底部
-    "Resistor":                0.18,  # 电阻: 引线细长, 色环体遮挡最严重
-    "Wire":                    0.02,  # 导线: 端点基本就是连接点
-}
-_DEFAULT_PIN_EXTENSION = 0.12
-
-# 最小延伸像素 — 即使 OBB 很小也要保证一定延伸量, 防止引脚卡在元件体内
-_MIN_EXTENSION_PX = 6
+from vision.pin_utils import COMPONENT_PIN_PROPS, DEFAULT_PIN_PROPS, MIN_EXTENSION_PX
 
 
 @dataclass
@@ -53,6 +30,9 @@ class Detection:
     is_obb: bool = False                      # 是否为旋转检测结果
     obb_corners: Optional[np.ndarray] = None  # OBB 四角坐标 (4,2)
     wire_color: Optional[str] = None          # 导线颜色 (仅 Wire 类型, 由 WireAnalyzer 填充)
+    # YOLO-Pose 关键点 (预留, 当模型升级为 Pose 时启用)
+    keypoints: Optional[np.ndarray] = None    # (N, 3) — x, y, conf per keypoint
+    keypoints_conf: Optional[float] = None    # 关键点平均置信度
 
 
 class ComponentDetector:
@@ -199,12 +179,13 @@ class ComponentDetector:
                 long_len = d01
 
             # 沿长轴向外延伸, 补偿元件遮挡
-            ext_ratio = _PIN_EXTENSION.get(cls_name, _DEFAULT_PIN_EXTENSION)
+            props = COMPONENT_PIN_PROPS.get(cls_name, DEFAULT_PIN_PROPS)
+            ext_ratio = props["ext_ratio"]
             direction = mid2 - mid1
             dir_len = np.linalg.norm(direction)
             if dir_len > 1e-5:
                 unit_dir = direction / dir_len
-                extension = max(ext_ratio * long_len, _MIN_EXTENSION_PX)
+                extension = max(ext_ratio * long_len, MIN_EXTENSION_PX)
                 pin1 = tuple((mid1 - unit_dir * extension).tolist())
                 pin2 = tuple((mid2 + unit_dir * extension).tolist())
             else:
@@ -226,15 +207,16 @@ class ComponentDetector:
 
         将引脚估计从 bbox 边缘向外延伸, 更接近真实插入点。
         """
-        ext_ratio = _PIN_EXTENSION.get(cls_name, _DEFAULT_PIN_EXTENSION)
+        props = COMPONENT_PIN_PROPS.get(cls_name, DEFAULT_PIN_PROPS)
+        ext_ratio = props["ext_ratio"]
         if w > h:
             # 水平元件: 引脚在左右两端外侧
-            extension = max(w * ext_ratio, _MIN_EXTENSION_PX)
+            extension = max(w * ext_ratio, MIN_EXTENSION_PX)
             pin1 = (x1 - extension, cy)
             pin2 = (x2 + extension, cy)
         else:
             # 垂直元件: 引脚在上下两端外侧
-            extension = max(h * ext_ratio, _MIN_EXTENSION_PX)
+            extension = max(h * ext_ratio, MIN_EXTENSION_PX)
             pin1 = (cx, y1 - extension)
             pin2 = (cx, y2 + extension)
         return pin1, pin2
